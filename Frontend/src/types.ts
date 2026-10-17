@@ -46,6 +46,8 @@ export interface Edition {
   ticker: string[];
   stories: Story[];
   editorNote: string;
+  language?: 'en' | 'ur';
+  translationError?: string;
 }
 
 export interface InterestWeight {

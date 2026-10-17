@@ -32,7 +32,8 @@ export default function Paper() {
       const res = await sendEditorNote({ message: text } as any);
       setNoteMsg(res.summary || 'Got it. Your editor will adjust tomorrow\u2019s paper.');
       setNote('');
-      const ed = await generateEdition();
+      const currentLang = edition?.language === 'ur' ? 'ur' : undefined;
+      const ed = await generateEdition(currentLang as any);
       setEdition(ed);
     } catch {
       setNoteMsg('Your editor could not take that note right now. Try again.');
@@ -41,7 +42,7 @@ export default function Paper() {
     }
   };
   const user = getUser();
-  const isUrdu = user?.language === 'ur';
+  const isUrdu = edition?.language === 'ur';
   const showImages = user?.visual_mode !== 'reader';
 
   useEffect(() => {
@@ -70,7 +71,8 @@ export default function Paper() {
   const handleRegenerate = async () => {
     setGenerating(true);
     try {
-      const ed = await generateEdition();
+      const currentLang = edition?.language === 'ur' ? 'ur' : undefined;
+      const ed = await generateEdition(currentLang as any);
       setEdition(ed);
     } catch {
       setError('Could not regenerate. Please try again.');
@@ -83,7 +85,7 @@ export default function Paper() {
     setGenerating(true);
     try {
       await updatePreferences({ language: lang });
-      const ed = await generateEdition();
+      const ed = await generateEdition(lang);
       setEdition(ed);
     } catch {
       setError('Could not switch language. Please try again.');
@@ -179,7 +181,7 @@ export default function Paper() {
               className={btn}
             >
               <Languages className="h-3.5 w-3.5" />
-              {isUrdu ? 'English' : 'اردو'}
+              {isUrdu ? 'ENGLISH' : 'اردو'}
             </button>
             <button onClick={handleRegenerate} disabled={generating} className={btn}>
               <RefreshCw className={`h-3.5 w-3.5 ${generating ? 'animate-spin' : ''}`} />
@@ -211,6 +213,13 @@ export default function Paper() {
             </div>
           </div>
         </div>
+        {/* Translation error banner */}
+        {edition.translationError && (
+          <div className="no-print mt-4 flex items-center gap-2 rounded-lg border border-amber-400/50 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-900/20 dark:text-amber-200">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            {edition.translationError}
+          </div>
+        )}
         {/* Tell your editor */}
         <div className="no-print mt-4 rounded-lg border border-ink/15 p-4 dark:border-cream-ink/15">
           <label className="block">

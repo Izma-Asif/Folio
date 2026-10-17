@@ -343,6 +343,8 @@ function mapEdition(raw: any): Edition {
     ticker,
     stories,
     editorNote,
+    language: raw.language || 'en',
+    translationError: raw.translation_error || undefined,
   };
 }
 
@@ -404,9 +406,10 @@ export async function getEdition(id: string): Promise<Edition | null> {
   }
 }
 
-export async function generateEdition(): Promise<Edition> {
+export async function generateEdition(lang?: Language): Promise<Edition> {
   const userId = getUserId();
-  const raw = await apiFetch<any>(`/api/editions/generate?user_id=${encodeURIComponent(userId)}`, {
+  const langParam = lang && lang !== 'en' ? `&lang=${encodeURIComponent(lang)}` : '';
+  const raw = await apiFetch<any>(`/api/editions/generate?user_id=${encodeURIComponent(userId)}${langParam}`, {
     method: 'POST',
   });
 

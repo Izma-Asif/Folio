@@ -1,8 +1,13 @@
 import os
+import re
+import uuid
+import json
 import logging
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
+import httpx
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Response, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -18,6 +23,7 @@ logger = logging.getLogger("folio.main")
 # Import Folio modules
 from db import (
     DEFAULT_USER_ID,
+    get_supabase,
     get_or_create_user,
     get_user,
     update_user_preferences,
@@ -37,11 +43,12 @@ from sources import (
     add_custom_feed_for_user,
 )
 from fetcher import fetch_all, ingest_all_sources
-from scorer import score_new_articles, cluster_articles
+from scorer import ALLOWED_TOPICS, score_new_articles, cluster_articles
 from learner import record_interaction, get_user_learning_profile
 from angles import analyze_article_angles
 from editor import generate_daily_edition
 from pdf_maker import generate_edition_pdf, render_edition_html
+from ai import gemini_json
 
 app = FastAPI(
     title="Folio API",
@@ -74,6 +81,27 @@ app.add_middleware(
 # PYDANTIC SCHEMAS
 # ---------------------------------------------------------------------------
 
+class UserCreate(BaseModel):
+    interests: List[str] = Field(default_factory=list)
+    custom_feeds: Optional[List[str]] = Field(default_factory=list)
+    language: Optional[str] = "en"
+    calm_mode: Optional[bool] = False
+    visual_mode: Optional[str] = "broadsheet"
+
+
+class UserPatch(BaseModel):
+    interests: Optional[List[str]] = None
+    custom_feeds: Optional[List[str]] = None
+    language: Optional[str] = None
+    calm_mode: Optional[bool] = None
+    visual_mode: Optional[str] = None
+    depth: Optional[str] = None
+    length: Optional[str] = None
+    topic: Optional[str] = None
+    weight: Optional[float] = None
+    topic_weights: Optional[Dict[str, float]] = None
+
+
 class UserUpdate(BaseModel):
     interests: Optional[List[str]] = None
     custom_feeds: Optional[List[str]] = None
@@ -82,6 +110,10 @@ class UserUpdate(BaseModel):
     visual_mode: Optional[str] = None
     depth: Optional[str] = None
     length: Optional[str] = None
+
+
+class InferInterestsRequest(BaseModel):
+    text: str
 
 
 class WeightUpdate(BaseModel):
@@ -120,6 +152,91 @@ def health_check():
 # USERS & PREFERENCES
 # ---------------------------------------------------------------------------
 
+@app.post("/api/users")
+def create_user_endpoint(req: UserCreate):
+    """
+    Creates a new user and sets topic_weights to 0.8 for chosen interests
+    and 0.3 for all other topics. Returns {user_id}.
+    """
+    client = get_supabase()
+    user_id = str(uuid.uuid4())
+
+    user_record = {
+        "id": user_id,
+        "interests": req.interests,
+        "custom_feeds": req.custom_feeds or [],
+        "language": req.language or "en",
+        "calm_mode": req.calm_mode if req.calm_mode is not None else False,
+        "visual_mode": req.visual_mode or "broadsheet",
+        "depth": "balanced",
+        "length": "medium",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    try:
+        client.table("users").insert(user_record).execute()
+    except Exception as e:
+        logger.error(f"Error creating user in Supabase: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create user: {e}")
+
+    # Set topic_weights to 0.8 for chosen interests and 0.3 for all other topics
+    chosen_interests_lower = {i.lower().strip() for i in req.interests}
+    for topic in ALLOWED_TOPICS:
+        weight = 0.8 if topic.lower() in chosen_interests_lower else 0.3
+        update_topic_weight(user_id, topic.lower(), weight)
+
+    return {"user_id": user_id}
+
+
+@app.get("/api/users/{user_id}/profile")
+def get_user_profile_and_weights(user_id: str):
+    """Returns user settings + topic weights."""
+    user = get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    weights = get_topic_weights(user_id)
+    profile = dict(user)
+    profile["topic_weights"] = weights
+    return profile
+
+
+@app.patch("/api/users/{user_id}")
+def patch_user(user_id: str, updates: UserPatch):
+    """Updates user settings or sets a topic weight."""
+    user = get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    payload = updates.model_dump(exclude_unset=True)
+
+    # 1. Topic weight updates
+    single_topic = payload.pop("topic", None)
+    single_weight = payload.pop("weight", None)
+    dict_weights = payload.pop("topic_weights", None)
+
+    if single_topic and single_weight is not None:
+        update_topic_weight(user_id, single_topic, float(single_weight))
+
+    if dict_weights and isinstance(dict_weights, dict):
+        for t, w in dict_weights.items():
+            if w is not None:
+                update_topic_weight(user_id, t, float(w))
+
+    # 2. User settings updates
+    valid_settings = {"interests", "custom_feeds", "language", "calm_mode", "visual_mode", "depth", "length"}
+    settings_payload = {k: v for k, v in payload.items() if k in valid_settings and v is not None}
+    if settings_payload:
+        updated_user = update_user_preferences(user_id, settings_payload)
+        if updated_user:
+            user = updated_user
+
+    weights = get_topic_weights(user_id)
+    result = dict(user)
+    result["topic_weights"] = weights
+    return result
+
+
 @app.get("/api/users/{user_id}")
 def get_user_profile(user_id: str):
     """Retrieves user profile and newspaper reading settings."""
@@ -152,6 +269,172 @@ def set_weight(user_id: str, req: WeightUpdate):
     if not ok:
         raise HTTPException(status_code=400, detail="Failed to update topic weight")
     return {"topic": req.topic, "weight": req.weight}
+
+
+# ---------------------------------------------------------------------------
+# INFER INTERESTS FROM TEXT & URLS
+# ---------------------------------------------------------------------------
+
+TOPIC_KEYWORDS: Dict[str, List[str]] = {
+    "Pakistan": ["pakistan", "urdu", "lahore", "karachi", "islamabad", "pakistani"],
+    "World": ["world", "global", "international", "foreign", "geopolitics"],
+    "Politics": ["politics", "political", "government", "parliament", "election", "policy", "minister"],
+    "Business": ["business", "finance", "economy", "market", "startup", "stock", "trade", "investment"],
+    "Tech": ["tech", "technology", "software", "hardware", "gadget", "cyber", "coding", "developer"],
+    "AI": ["ai", "artificial intelligence", "machine learning", "llm", "openai", "deep learning", "neural"],
+    "Sports": ["sports", "football", "soccer", "tennis", "olympics", "athletics", "basketball"],
+    "Cricket": ["cricket", "babar", "kohli", "test match", "t20", "odi", "psl", "ipl", "pitch", "wicket"],
+    "Science": ["science", "space", "nasa", "physics", "biology", "research", "scientific", "astronomy"],
+    "Health": ["health", "medical", "medicine", "doctor", "wellness", "disease", "hospital", "pharma"],
+    "Entertainment": ["entertainment", "movie", "film", "music", "cinema", "actor", "actress", "hollywood", "series", "tv"],
+    "Culture": ["culture", "art", "history", "literature", "heritage", "museum", "cultural"],
+    "Climate": ["climate", "environment", "carbon", "warming", "renewable", "pollution", "sustainability"]
+}
+
+
+def extract_urls_from_text(text: str) -> List[str]:
+    """Finds all HTTP/HTTPS and www URLs in text."""
+    url_pattern = r'(?:https?://|www\.)[^\s<>"\'\)]+'
+    raw_urls = re.findall(url_pattern, text)
+    cleaned = []
+    for u in raw_urls:
+        u = u.rstrip(".,;!?:")
+        if u.startswith("www."):
+            u = "https://" + u
+        if u not in cleaned:
+            cleaned.append(u)
+    return cleaned
+
+
+def fetch_url_metadata(url: str) -> Optional[Dict[str, str]]:
+    """Fetches title and description for a URL with a 5-second timeout, ignoring failures."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Folio/1.0"
+        }
+        with httpx.Client(timeout=5.0, follow_redirects=True, headers=headers) as client:
+            resp = client.get(url)
+            if resp.status_code != 200:
+                return None
+            html = resp.text
+
+        soup = BeautifulSoup(html, "html.parser")
+        title = ""
+        og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "og:title"})
+        if og_title and og_title.get("content"):
+            title = og_title["content"].strip()
+        elif soup.title and soup.title.string:
+            title = soup.title.string.strip()
+
+        description = ""
+        og_desc = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "og:description"}) or soup.find("meta", attrs={"name": "description"})
+        if og_desc and og_desc.get("content"):
+            description = og_desc["content"].strip()
+
+        if title or description:
+            return {"url": url, "title": title, "description": description}
+        return None
+    except Exception as e:
+        logger.debug(f"Failed to fetch metadata for {url} (ignored): {e}")
+        return None
+
+
+def fallback_infer_interests(text: str, url_metadata: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Rule-based fallback interest inference when Gemini is unavailable."""
+    combined = text.lower()
+    for m in url_metadata:
+        combined += " " + m.get("title", "").lower() + " " + m.get("description", "").lower()
+
+    matched: List[str] = []
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        if topic.lower() in combined or any(kw in combined for kw in keywords):
+            matched.append(topic)
+
+    if not matched:
+        matched = ["World", "Tech"]
+
+    style = "deep" if any(w in combined for w in ["deep", "in-depth", "long", "detailed", "analysis", "essay"]) else "short"
+
+    if len(matched) == 1:
+        top_str = matched[0]
+    elif len(matched) == 2:
+        top_str = f"{matched[0]} and {matched[1]}"
+    else:
+        top_str = f"{', '.join(matched[:-1])}, and {matched[-1]}"
+
+    summary = f"You seem to like {top_str} news, in {style} reads."
+    return {"topics": matched, "style": style, "summary": summary}
+
+
+@app.post("/api/infer-interests")
+def api_infer_interests(req: InferInterestsRequest):
+    """
+    Infers topics, reading depth style ('short' or 'deep'), and a summary sentence
+    from free-form text and pasted article/channel URLs.
+    """
+    text = req.text.strip()
+    if not text:
+        return {
+            "topics": ["World", "Tech"],
+            "style": "short",
+            "summary": "You seem to like World and Tech news, in short reads."
+        }
+
+    # Extract URLs and fetch metadata with 5s timeout, ignoring failures
+    urls = extract_urls_from_text(text)
+    url_metadata: List[Dict[str, str]] = []
+    for u in urls[:5]:
+        meta = fetch_url_metadata(u)
+        if meta:
+            url_metadata.append(meta)
+
+    prompt = f"""You are an intelligent onboarding assistant for Folio, a bespoke morning newspaper.
+The reader provided the following text about what they read (which may include article links, channel names, or topic preferences):
+\"\"\"{text}\"\"\"
+
+Webpage metadata fetched from links:
+{json.dumps(url_metadata, indent=2) if url_metadata else "No link metadata"}
+
+Allowed topics strictly limited to:
+{ALLOWED_TOPICS}
+
+Analyze their interests and reading depth. Return a JSON object with:
+- "topics": list of topic strings chosen strictly from the allowed topics list above.
+- "style": strictly "short" or "deep" ("short" for brief overviews, digests, or quick scans; "deep" for comprehensive deep-dives or investigative pieces).
+- "summary": exactly one friendly sentence like 'You seem to like Pakistani business news and AI tools, in short reads.'
+
+Return valid JSON with keys ["topics", "style", "summary"]."""
+
+    res = gemini_json(prompt)
+    if isinstance(res, dict) and "topics" in res:
+        allowed_lower = {t.lower(): t for t in ALLOWED_TOPICS}
+        matched_topics: List[str] = []
+        raw_topics = res.get("topics", [])
+        if isinstance(raw_topics, list):
+            for rt in raw_topics:
+                if isinstance(rt, str) and rt.lower().strip() in allowed_lower:
+                    canonical = allowed_lower[rt.lower().strip()]
+                    if canonical not in matched_topics:
+                        matched_topics.append(canonical)
+
+        style = res.get("style", "short").lower().strip()
+        if style not in ("short", "deep"):
+            style = "short"
+
+        summary = res.get("summary")
+        if not summary or not isinstance(summary, str):
+            top_str = ", ".join(matched_topics) if matched_topics else "general news"
+            summary = f"You seem to like {top_str}, in {style} reads."
+
+        if matched_topics:
+            return {
+                "topics": matched_topics,
+                "style": style,
+                "summary": summary
+            }
+
+    # Fallback heuristic
+    return fallback_infer_interests(text, url_metadata)
 
 
 # ---------------------------------------------------------------------------

@@ -4,121 +4,114 @@ from db import get_user, update_user_preferences
 
 logger = logging.getLogger("folio.sources")
 
-# Curated catalog of high-credibility default feeds
-DEFAULT_SOURCES: List[Dict[str, Any]] = [
-    # Tech & AI
+# 15 Curated RSS feeds across required categories
+FEEDS: List[Dict[str, str]] = [
+    # Pakistan (Dawn, Express Tribune, ProPakistani)
     {
-        "name": "Ars Technica",
-        "url": "https://feeds.arstechnica.com/arstechnica/index",
-        "topic": "tech",
-        "credibility": 0.95,
-        "language": "en"
+        "name": "Dawn",
+        "url": "https://www.dawn.com/feeds/home",
+        "default_topic": "pakistan"
+    },
+    {
+        "name": "Express Tribune",
+        "url": "https://tribune.com.pk/feed/latest",
+        "default_topic": "pakistan"
+    },
+    {
+        "name": "ProPakistani",
+        "url": "https://propakistani.pk/feed/",
+        "default_topic": "pakistan"
+    },
+
+    # World (BBC World, Al Jazeera)
+    {
+        "name": "BBC World",
+        "url": "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "default_topic": "world"
+    },
+    {
+        "name": "Al Jazeera",
+        "url": "https://www.aljazeera.com/xml/rss/all.xml",
+        "default_topic": "world"
+    },
+
+    # Business
+    {
+        "name": "BBC Business",
+        "url": "https://feeds.bbci.co.uk/news/business/rss.xml",
+        "default_topic": "business"
+    },
+
+    # Tech (TechCrunch, The Verge, Hacker News)
+    {
+        "name": "TechCrunch",
+        "url": "https://techcrunch.com/feed/",
+        "default_topic": "tech"
     },
     {
         "name": "The Verge",
         "url": "https://www.theverge.com/rss/index.xml",
-        "topic": "tech",
-        "credibility": 0.90,
-        "language": "en"
-    },
-    {
-        "name": "TechCrunch",
-        "url": "https://techcrunch.com/feed/",
-        "topic": "tech",
-        "credibility": 0.88,
-        "language": "en"
-    },
-    {
-        "name": "MIT Technology Review",
-        "url": "https://www.technologyreview.com/feed/",
-        "topic": "ai",
-        "credibility": 0.96,
-        "language": "en"
+        "default_topic": "tech"
     },
     {
         "name": "Hacker News",
         "url": "https://news.ycombinator.com/rss",
-        "topic": "tech",
-        "credibility": 0.85,
-        "language": "en"
+        "default_topic": "tech"
     },
-    # Science & Space
+
+    # Sports (BBC Sport, ESPNcricinfo)
     {
-        "name": "Quanta Magazine",
-        "url": "https://api.quantamagazine.org/feed/",
-        "topic": "science",
-        "credibility": 0.98,
-        "language": "en"
+        "name": "BBC Sport",
+        "url": "https://feeds.bbci.co.uk/sport/rss.xml",
+        "default_topic": "sports"
     },
     {
-        "name": "ScienceDaily",
-        "url": "https://www.sciencedaily.com/rss/all.xml",
-        "topic": "science",
-        "credibility": 0.92,
-        "language": "en"
+        "name": "ESPNcricinfo",
+        "url": "https://www.espncricinfo.com/rss/content/story/feeds/0.xml",
+        "default_topic": "sports"
     },
+
+    # Science (NASA, Nature News)
     {
-        "name": "NASA News",
+        "name": "NASA",
         "url": "https://www.nasa.gov/news-release/feed/",
-        "topic": "science",
-        "credibility": 0.99,
-        "language": "en"
-    },
-    # Business & Economics
-    {
-        "name": "The Economist",
-        "url": "https://www.economist.com/the-world-this-week/rss.xml",
-        "topic": "business",
-        "credibility": 0.96,
-        "language": "en"
+        "default_topic": "science"
     },
     {
-        "name": "Financial Times",
-        "url": "https://www.ft.com/rss/home",
-        "topic": "business",
-        "credibility": 0.97,
-        "language": "en"
+        "name": "Nature News",
+        "url": "https://www.nature.com/nature.rss",
+        "default_topic": "science"
     },
-    # World & Culture
+
+    # Health
     {
-        "name": "BBC World News",
-        "url": "http://feeds.bbci.co.uk/news/world/rss.xml",
-        "topic": "world",
-        "credibility": 0.94,
-        "language": "en"
+        "name": "BBC Health",
+        "url": "https://feeds.bbci.co.uk/news/health/rss.xml",
+        "default_topic": "health"
     },
+
+    # Entertainment
     {
-        "name": "NPR News",
-        "url": "https://feeds.npr.org/1001/rss.xml",
-        "topic": "world",
-        "credibility": 0.93,
-        "language": "en"
-    },
-    {
-        "name": "The Atlantic",
-        "url": "https://www.theatlantic.com/feed/all/",
-        "topic": "culture",
-        "credibility": 0.92,
-        "language": "en"
-    },
-    # Design & Lifestyle
-    {
-        "name": "Dezeen",
-        "url": "https://www.dezeen.com/feed/",
-        "topic": "design",
-        "credibility": 0.90,
-        "language": "en"
-    },
-    {
-        "name": "Smashing Magazine",
-        "url": "https://www.smashingmagazine.com/feed/",
-        "topic": "design",
-        "credibility": 0.91,
-        "language": "en"
+        "name": "BBC Entertainment",
+        "url": "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
+        "default_topic": "entertainment"
     }
 ]
 
-TOPICS: List[str] = ["tech", "ai", "science", "business", "world", "culture", "design"]
+# Alias for compatibility with rest of codebase
+DEFAULT_SOURCES = FEEDS
+RSS_FEEDS = FEEDS
+
+TOPICS: List[str] = [
+    "pakistan",
+    "world",
+    "business",
+    "tech",
+    "sports",
+    "science",
+    "health",
+    "entertainment"
+]
 
 
 def get_available_topics() -> List[str]:
@@ -126,12 +119,12 @@ def get_available_topics() -> List[str]:
     return TOPICS.copy()
 
 
-def get_default_sources(topic: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_default_sources(topic: Optional[str] = None) -> List[Dict[str, str]]:
     """Returns curated default RSS sources, optionally filtered by topic."""
     if not topic:
-        return [dict(s) for s in DEFAULT_SOURCES]
+        return [dict(s) for s in FEEDS]
     clean_topic = topic.lower().strip()
-    return [dict(s) for s in DEFAULT_SOURCES if s.get("topic") == clean_topic]
+    return [dict(s) for s in FEEDS if s.get("default_topic") == clean_topic]
 
 
 def get_sources_for_user(user_id: str) -> List[Dict[str, Any]]:
@@ -144,8 +137,8 @@ def get_sources_for_user(user_id: str) -> List[Dict[str, Any]]:
     user_interests_set = set(t.lower() for t in interests)
 
     selected_sources = []
-    for s in DEFAULT_SOURCES:
-        if s["topic"] in user_interests_set or not user_interests_set:
+    for s in FEEDS:
+        if s["default_topic"] in user_interests_set or not user_interests_set:
             selected_sources.append(dict(s))
 
     # Add custom feeds defined by user
@@ -154,8 +147,7 @@ def get_sources_for_user(user_id: str) -> List[Dict[str, Any]]:
             selected_sources.append({
                 "name": custom_url.split("/")[2] if "://" in custom_url else "Custom Feed",
                 "url": custom_url,
-                "topic": "custom",
-                "credibility": 0.85,
+                "default_topic": "custom",
                 "language": user.get("language", "en")
             })
 

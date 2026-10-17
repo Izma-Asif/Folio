@@ -1,235 +1,260 @@
 import re
-import uuid
-import hashlib
+import email.utils
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
-try:
-    import feedparser
-except ImportError:
-    feedparser = None
+import feedparser
+import httpx
+from bs4 import BeautifulSoup
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
-
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    BeautifulSoup = None
-
-from ai import gemini_json
-from db import upsert_article
-from sources import DEFAULT_SOURCES
+from db import get_supabase
+from sources import FEEDS
 
 logger = logging.getLogger("folio.fetcher")
 
 
-def clean_html(raw_html: str) -> str:
-    """Strips markup, scripts, and formats clean readable text."""
+def strip_html(raw_html: str) -> str:
+    """Strips all HTML tags and collapses whitespace to return clean plain text."""
     if not raw_html:
         return ""
-    if BeautifulSoup is None:
-        # Fallback regex strip
-        clean = re.sub(r"<[^>]+>", " ", raw_html)
-        return " ".join(clean.split())
-
     try:
         soup = BeautifulSoup(raw_html, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "form"]):
+        for tag in soup(["script", "style", "nav", "footer", "header", "form", "iframe"]):
             tag.decompose()
         text = soup.get_text(separator=" ")
         return " ".join(text.split())
-    except Exception as e:
-        logger.debug(f"clean_html error: {e}")
-        return " ".join(raw_html.split())
+    except Exception:
+        clean = re.sub(r"<[^>]+>", " ", raw_html)
+        return " ".join(clean.split())
 
 
 def extract_image_url(entry: Any, raw_summary: str) -> Optional[str]:
-    """Finds lead image from RSS enclosure, media_content, or HTML summary."""
-    # 1. RSS Enclosures
-    if hasattr(entry, "enclosures") and entry.enclosures:
-        for enc in entry.enclosures:
-            if enc.get("type", "").startswith("image/"):
-                return enc.get("href")
+    """
+    Extracts lead image URL checking in order:
+    1. media_content
+    2. media_thumbnail
+    3. enclosures
+    4. First <img> tag in raw summary
+    Returns None if no image is found.
+    """
+    # 1. media_content
+    media_content = getattr(entry, "media_content", None) or entry.get("media_content")
+    if media_content and isinstance(media_content, list):
+        for item in media_content:
+            if isinstance(item, dict) and item.get("url"):
+                url = item["url"]
+                medium = item.get("medium", "")
+                mtype = item.get("type", "")
+                if medium == "image" or mtype.startswith("image/") or not medium:
+                    return url
 
-    # 2. Media content (Yahoo Media RSS)
-    if hasattr(entry, "media_content") and entry.media_content:
-        for m in entry.media_content:
-            if "url" in m:
-                return m["url"]
+    # 2. media_thumbnail
+    media_thumbnail = getattr(entry, "media_thumbnail", None) or entry.get("media_thumbnail")
+    if media_thumbnail and isinstance(media_thumbnail, list):
+        for item in media_thumbnail:
+            if isinstance(item, dict) and item.get("url"):
+                return item["url"]
 
-    # 3. Media thumbnail
-    if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
-        for m in entry.media_thumbnail:
-            if "url" in m:
-                return m["url"]
+    # 3. enclosures
+    enclosures = getattr(entry, "enclosures", None) or entry.get("enclosures")
+    if enclosures and isinstance(enclosures, list):
+        for enc in enclosures:
+            if isinstance(enc, dict):
+                href = enc.get("href")
+                etype = enc.get("type", "")
+                if href:
+                    if etype.startswith("image/") or any(href.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]):
+                        return href
 
-    # 4. Extract from HTML body
-    if BeautifulSoup and raw_summary:
+    # 4. First <img> in the summary / content
+    if raw_summary:
         try:
             soup = BeautifulSoup(raw_summary, "html.parser")
             img = soup.find("img")
             if img and img.get("src"):
                 src = img["src"]
-                # Filter out tracking 1x1 pixels
-                if not re.search(r"(1x1|pixel|spacer|feedburner|track)", src, re.IGNORECASE):
+                # Skip tiny tracking pixels
+                if not any(pixel in src.lower() for pixel in ["1x1", "pixel", "tracking", "spacer", "feedburner"]):
                     return src
         except Exception:
             pass
 
+    # 5. If none, null
     return None
 
 
-def generate_cluster_key(title: str) -> str:
-    """Generates a normalized cluster ID for grouping identical or related breaking stories."""
-    # Strip common noise and punctuation
-    cleaned = re.sub(r"[^\w\s]", "", title.lower())
-    words = [w for w in cleaned.split() if len(w) > 3][:6]
-    key_phrase = " ".join(words)
-    return hashlib.md5(key_phrase.encode("utf-8")).hexdigest()[:12]
+def parse_published_datetime(entry: Any) -> datetime:
+    """Parses published date from entry into timezone-aware UTC datetime."""
+    # Try published_parsed / updated_parsed struct_time
+    for attr in ("published_parsed", "updated_parsed"):
+        st = getattr(entry, attr, None)
+        if st:
+            try:
+                return datetime(*st[:6], tzinfo=timezone.utc)
+            except Exception:
+                pass
+
+    # Try raw string parsing
+    for attr in ("published", "pubDate", "updated", "created"):
+        val = getattr(entry, attr, None) or entry.get(attr)
+        if val and isinstance(val, str):
+            try:
+                dt = email.utils.parsedate_to_datetime(val)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                return dt
+            except Exception:
+                try:
+                    dt = datetime.fromisoformat(val)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    else:
+                        dt = dt.astimezone(timezone.utc)
+                    return dt
+                except Exception:
+                    pass
+
+    return datetime.now(timezone.utc)
 
 
-def enrich_article_with_ai(title: str, summary: str, default_topic: str) -> Dict[str, Any]:
+def fetch_all() -> Dict[str, Any]:
     """
-    Uses gemini_json to synthesize an AI executive summary, classify topic,
-    and determine tone. Falls back cleanly if AI is unavailable.
+    Loops all RSS feeds and user custom_feeds with feedparser.
+    Wraps each feed in try/except with a 10-second timeout so one dead feed never breaks the run.
+    Extracts article metadata, skips articles older than 48 hours, and upserts
+    into Supabase 'articles' using link as the unique key.
+    
+    Returns:
+        Dict containing 'articles_saved' (int) and 'failed_feeds' (List[Dict[str, str]]).
     """
-    prompt = f"""
-You are the lead editor for Folio, a personalized daily morning newspaper.
-Analyze this news item:
-Title: {title}
-Summary: {summary}
-Default Topic: {default_topic}
+    client = get_supabase()
 
-Return a JSON object with exactly these keys:
-- "ai_summary": A crisp, high-signal 1-2 sentence executive briefing explaining what happened and why it matters.
-- "topic": One of ["tech", "ai", "science", "business", "world", "culture", "design"].
-- "tone": One of ["informative", "critical", "optimistic", "neutral", "urgent"].
-"""
-    result = gemini_json(prompt)
-    if isinstance(result, dict) and "ai_summary" in result:
-        return {
-            "ai_summary": result.get("ai_summary", summary[:200]),
-            "topic": result.get("topic", default_topic),
-            "tone": result.get("tone", "neutral")
-        }
+    # 1. Start with curated 15 feeds
+    all_feeds: List[Dict[str, str]] = [dict(f) for f in FEEDS]
+    seen_urls = set(f["url"].lower().strip() for f in FEEDS)
 
-    # Fallback heuristic
+    # 2. Gather any custom feeds defined across users.custom_feeds
+    try:
+        users_resp = client.table("users").select("custom_feeds").execute()
+        for u in (users_resp.data or []):
+            custom_list = u.get("custom_feeds") or []
+            for c_url in custom_list:
+                if c_url and isinstance(c_url, str):
+                    clean_c = c_url.strip()
+                    if clean_c.lower() not in seen_urls:
+                        seen_urls.add(clean_c.lower())
+                        source_name = clean_c.split("/")[2] if "://" in clean_c else "Custom Feed"
+                        all_feeds.append({
+                            "name": source_name,
+                            "url": clean_c,
+                            "default_topic": "custom"
+                        })
+    except Exception as e:
+        logger.warning(f"Could not load custom_feeds from users table: {e}")
+
+    failed_feeds: List[Dict[str, str]] = []
+    articles_saved = 0
+    now = datetime.now(timezone.utc)
+    cutoff_time = now - timedelta(hours=48)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Folio/1.0",
+        "Accept": "application/rss+xml, application/rdf+xml, application/atom+xml, application/xml, text/xml, */*"
+    }
+
+    # 3. Process feeds with 10-second timeout per feed
+    for feed_info in all_feeds:
+        feed_name = feed_info.get("name", "Unknown Feed")
+        feed_url = feed_info.get("url", "").strip()
+        default_topic = feed_info.get("default_topic", "world")
+
+        if not feed_url:
+            continue
+
+        try:
+            logger.info(f"Fetching RSS feed: {feed_name} ({feed_url})")
+            
+            # Fetch content with strict 10s timeout via httpx
+            with httpx.Client(timeout=10.0, follow_redirects=True, headers=headers) as http_client:
+                resp = http_client.get(feed_url)
+                resp.raise_for_status()
+                feed_data = resp.content
+
+            parsed = feedparser.parse(feed_data)
+
+            # If entries empty and bozo flag raised without feed title, treat as failed feed
+            if not parsed.entries and getattr(parsed, "bozo", 0) != 0 and not getattr(parsed, "feed", None):
+                raise ValueError(f"Empty or unparseable XML feed from {feed_url}")
+
+            # 4. Extract entries and upsert
+            for entry in parsed.entries:
+                link = getattr(entry, "link", None) or entry.get("link")
+                title = getattr(entry, "title", None) or entry.get("title")
+
+                if not link or not title:
+                    continue
+
+                link = str(link).strip()
+                title = str(title).strip()
+
+                # Published date check: Skip articles older than 48 hours
+                pub_dt = parse_published_datetime(entry)
+                if pub_dt < cutoff_time:
+                    continue
+
+                # Clean summary
+                raw_summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
+                text_summary = strip_html(raw_summary)
+
+                # Extract image_url: media_content, media_thumbnail, enclosures, or <img>
+                image_url = extract_image_url(entry, raw_summary)
+
+                # Prepare article record matching Supabase articles table
+                article_record = {
+                    "title": title,
+                    "link": link,
+                    "source": feed_name,
+                    "summary": text_summary,
+                    "ai_summary": text_summary[:280] if text_summary else title,
+                    "topic": default_topic,
+                    "image_url": image_url,
+                    "tone": "neutral",
+                    "published_at": pub_dt.isoformat(),
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }
+
+                # Upsert into Supabase articles using link as unique key
+                try:
+                    res = client.table("articles").upsert(article_record, on_conflict="link").execute()
+                    if res.data:
+                        articles_saved += 1
+                except Exception as up_err:
+                    logger.debug(f"Article upsert error for {link}: {up_err}")
+
+        except Exception as exc:
+            logger.warning(f"Feed failed: {feed_name} ({feed_url}) - {exc}")
+            failed_feeds.append({
+                "name": feed_name,
+                "url": feed_url,
+                "error": str(exc)
+            })
+            continue
+
+    logger.info(f"fetch_all completed. Articles saved: {articles_saved}, Failed feeds: {len(failed_feeds)}")
     return {
-        "ai_summary": summary[:240] + ("..." if len(summary) > 240 else ""),
-        "topic": default_topic,
-        "tone": "informative"
+        "articles_saved": articles_saved,
+        "failed_feeds": failed_feeds
     }
 
 
-def parse_published_date(entry: Any) -> str:
-    """Extracts published timestamp as an ISO-8601 string."""
-    for attr in ("published_parsed", "updated_parsed"):
-        parsed_time = getattr(entry, attr, None)
-        if parsed_time:
-            try:
-                dt = datetime(*parsed_time[:6], tzinfo=timezone.utc)
-                return dt.isoformat()
-            except Exception:
-                pass
-    return datetime.now(timezone.utc).isoformat()
-
-
-def fetch_source_feed(source: Dict[str, Any], max_items: int = 10) -> List[Dict[str, Any]]:
-    """Fetches and parses a single RSS source."""
-    if feedparser is None:
-        logger.error("feedparser is not installed.")
-        return []
-
-    feed_url = source.get("url")
-    source_name = source.get("name", "Unknown")
-    default_topic = source.get("topic", "world")
-
-    logger.info(f"Fetching RSS feed from: {source_name} ({feed_url})")
-
-    try:
-        # User-agent header is important for modern RSS endpoints
-        headers = {
-            "User-Agent": "FolioNewspaper/1.0 (+https://folio-paper.app; contact@folio.local)"
-        }
-        
-        # Try fetching with httpx first to handle redirects and custom timeouts
-        xml_content = None
-        if httpx is not None:
-            try:
-                with httpx.Client(timeout=15.0, follow_redirects=True, headers=headers) as client:
-                    resp = client.get(feed_url)
-                    if resp.status_code == 200:
-                        xml_content = resp.text
-            except Exception as net_err:
-                logger.debug(f"httpx fetch failed for {feed_url}: {net_err}, falling back to feedparser direct")
-
-        if xml_content:
-            parsed = feedparser.parse(xml_content)
-        else:
-            parsed = feedparser.parse(feed_url, request_headers=headers)
-
-        articles = []
-        for entry in parsed.entries[:max_items]:
-            link = getattr(entry, "link", None)
-            title = getattr(entry, "title", None)
-            if not link or not title:
-                continue
-
-            raw_summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
-            cleaned_summary = clean_html(raw_summary)
-            image_url = extract_image_url(entry, raw_summary)
-            published_at = parse_published_date(entry)
-            cluster_id = generate_cluster_key(title)
-
-            # AI enrichment (executive summary, tone, confirmed topic)
-            enrichment = enrich_article_with_ai(title, cleaned_summary, default_topic)
-
-            article_record = {
-                "id": str(uuid.uuid4()),
-                "title": title.strip(),
-                "link": link.strip(),
-                "source": source_name,
-                "summary": cleaned_summary,
-                "ai_summary": enrichment.get("ai_summary", cleaned_summary[:200]),
-                "topic": enrichment.get("topic", default_topic),
-                "image_url": image_url,
-                "tone": enrichment.get("tone", "neutral"),
-                "cluster_id": cluster_id,
-                "published_at": published_at,
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }
-            articles.append(article_record)
-
-        return articles
-
-    except Exception as e:
-        logger.error(f"Error fetching feed {feed_url}: {e}")
-        return []
-
-
+# Backwards compatibility alias for other modules
 def ingest_all_sources(sources: Optional[List[Dict[str, Any]]] = None, max_per_source: int = 5) -> Dict[str, Any]:
-    """
-    Fetches articles across specified or default sources and upserts them into Supabase.
-    Returns ingestion statistics.
-    """
-    target_sources = sources if sources is not None else DEFAULT_SOURCES
-    total_fetched = 0
-    total_saved = 0
-
-    for src in target_sources:
-        items = fetch_source_feed(src, max_items=max_per_source)
-        total_fetched += len(items)
-        for item in items:
-            saved = upsert_article(item)
-            if saved:
-                total_saved += 1
-
+    """Compatibility wrapper calling fetch_all."""
+    res = fetch_all()
     return {
-        "sources_scanned": len(target_sources),
-        "articles_fetched": total_fetched,
-        "articles_saved_or_updated": total_saved
+        "articles_saved_or_updated": res.get("articles_saved", 0),
+        "failed_feeds": res.get("failed_feeds", [])
     }

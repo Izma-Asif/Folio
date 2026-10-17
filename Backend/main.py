@@ -36,7 +36,7 @@ from sources import (
     get_available_topics,
     add_custom_feed_for_user,
 )
-from fetcher import ingest_all_sources
+from fetcher import fetch_all, ingest_all_sources
 from learner import record_interaction, get_user_learning_profile
 from angles import analyze_article_angles
 from editor import generate_daily_edition
@@ -181,9 +181,18 @@ def add_custom_feed(user_id: str, req: CustomFeedRequest):
     return {"status": "success", "feed_url": req.feed_url}
 
 
+@app.post("/api/fetch")
+def api_fetch():
+    """
+    Fetches articles across all 15 default RSS feeds and user custom_feeds.
+    Returns the number of articles saved and the list of feeds that failed.
+    """
+    return fetch_all()
+
+
 @app.post("/api/sources/fetch")
 def trigger_fetch_sources(background_tasks: BackgroundTasks, max_per_source: int = Query(default=5, le=20)):
-    """Triggers immediate ingestion of latest articles from RSS sources."""
+    """Triggers background ingestion of latest articles from RSS sources."""
     background_tasks.add_task(ingest_all_sources, max_per_source=max_per_source)
     return {"status": "ingestion_started", "max_per_source": max_per_source}
 

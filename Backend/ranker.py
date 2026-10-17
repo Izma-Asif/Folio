@@ -202,72 +202,110 @@ def compute_edition_changes(
 ) -> List[str]:
     """
     Compares current edition topic distribution with user's previous edition
-    and produces 2 to 4 plain sentences explaining shifts.
-    Returns empty list if no previous edition exists.
+    (either today's pre-regeneration edition or an earlier edition) and incorporates
+    any recent AI Editor note to produce 2 to 4 plain sentences explaining shifts.
     """
     client = get_supabase()
 
-    # Find previous edition
+    # 1. Fetch recent editor notes from the last 24h for context
+    recent_note_summary = None
     try:
-        res = client.table("editions").select("content, edition_date").eq("user_id", user_id).neq("edition_date", today_date).order("edition_date", desc=True).limit(1).execute()
-        prev_editions = res.data or []
-        if not prev_editions:
-            return []
-        prev_content = prev_editions[0].get("content") or {}
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        notes_res = (
+            client.table("editor_notes")
+            .select("summary, note")
+            .eq("user_id", user_id)
+            .gte("created_at", cutoff)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if notes_res.data and len(notes_res.data) > 0:
+            recent_note_summary = notes_res.data[0].get("summary") or notes_res.data[0].get("note")
+    except Exception as e:
+        logger.debug(f"Error fetching recent editor note for changes: {e}")
+
+    # 2. Find previous edition:
+    # First check if an edition already exists for today (regeneration)
+    prev_content = None
+    try:
+        existing_today = (
+            client.table("editions")
+            .select("content")
+            .eq("user_id", user_id)
+            .eq("edition_date", today_date)
+            .execute()
+        )
+        if existing_today.data and len(existing_today.data) > 0:
+            prev_content = existing_today.data[0].get("content") or {}
+        else:
+            # Check previous date edition
+            prev_date_res = (
+                client.table("editions")
+                .select("content, edition_date")
+                .eq("user_id", user_id)
+                .neq("edition_date", today_date)
+                .order("edition_date", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if prev_date_res.data and len(prev_date_res.data) > 0:
+                prev_content = prev_date_res.data[0].get("content") or {}
     except Exception as e:
         logger.debug(f"Error fetching previous edition for changes comparison: {e}")
+
+    if not prev_content and not recent_note_summary:
         return []
-
-    # Count current topics
-    curr_counts: Dict[str, int] = {}
-    for a in current_articles:
-        t = (a.get("topic") or "World").capitalize()
-        curr_counts[t] = curr_counts.get(t, 0) + 1
-
-    # Count previous topics
-    prev_counts: Dict[str, int] = {}
-    prev_lead = prev_content.get("lead")
-    if prev_lead and prev_lead.get("topic"):
-        pt = prev_lead["topic"].capitalize()
-        prev_counts[pt] = prev_counts.get(pt, 0) + 1
-
-    for sec in prev_content.get("sections", []):
-        for a in sec.get("articles", []):
-            pt = (a.get("topic") or sec.get("topic") or "World").capitalize()
-            prev_counts[pt] = prev_counts.get(pt, 0) + 1
-
-    for a in prev_content.get("explore", []):
-        pt = (a.get("topic") or "World").capitalize()
-        prev_counts[pt] = prev_counts.get(pt, 0) + 1
-
-    if not prev_counts:
-        return []
-
-    # Compute differences
-    all_topics = set(curr_counts.keys()) | set(prev_counts.keys())
-    diffs = []
-    for t in all_topics:
-        c = curr_counts.get(t, 0)
-        p = prev_counts.get(t, 0)
-        diff = c - p
-        if diff != 0:
-            diffs.append((t, diff, c, p))
-
-    if not diffs:
-        return ["Today's edition maintains balanced coverage across your favorite sections."]
-
-    # Sort by absolute difference
-    diffs.sort(key=lambda x: abs(x[1]), reverse=True)
 
     sentences = []
-    for t, diff, c, p in diffs[:3]:
-        if diff > 0:
-            sentences.append(f"{diff} more {t} {'story was' if diff == 1 else 'stories were'} added to your lineup today.")
-        else:
-            sentences.append(f"{abs(diff)} fewer {t} {'story was' if abs(diff) == 1 else 'stories were'} featured compared to yesterday.")
+    if recent_note_summary:
+        clean_note = recent_note_summary.strip()
+        if not clean_note.endswith("."):
+            clean_note += "."
+        sentences.append(f"Editor update: {clean_note}")
 
-    if len(sentences) < 2 and diffs:
-        sentences.append("Sections have been adjusted to reflect your latest reading signals.")
+    if prev_content:
+        # Count current topics
+        curr_counts: Dict[str, int] = {}
+        for a in current_articles:
+            t = (a.get("topic") or "World").capitalize()
+            curr_counts[t] = curr_counts.get(t, 0) + 1
+
+        # Count previous topics
+        prev_counts: Dict[str, int] = {}
+        prev_lead = prev_content.get("lead")
+        if prev_lead and prev_lead.get("topic"):
+            pt = prev_lead["topic"].capitalize()
+            prev_counts[pt] = prev_counts.get(pt, 0) + 1
+
+        for sec in prev_content.get("sections", []):
+            for a in sec.get("articles", []):
+                pt = (a.get("topic") or sec.get("topic") or "World").capitalize()
+                prev_counts[pt] = prev_counts.get(pt, 0) + 1
+
+        for a in prev_content.get("explore", []):
+            pt = (a.get("topic") or "World").capitalize()
+            prev_counts[pt] = prev_counts.get(pt, 0) + 1
+
+        # Compute differences
+        all_topics = set(curr_counts.keys()) | set(prev_counts.keys())
+        diffs = []
+        for t in all_topics:
+            c = curr_counts.get(t, 0)
+            p = prev_counts.get(t, 0)
+            diff = c - p
+            if diff != 0:
+                diffs.append((t, diff, c, p))
+
+        diffs.sort(key=lambda x: abs(x[1]), reverse=True)
+        for t, diff, c, p in diffs[:3]:
+            if diff > 0:
+                sentences.append(f"{diff} more {t} {'story was' if diff == 1 else 'stories were'} added to your lineup.")
+            else:
+                sentences.append(f"{abs(diff)} fewer {t} {'story was' if abs(diff) == 1 else 'stories were'} featured in this reprint.")
+
+    if not sentences and prev_content:
+        sentences.append("Edition reprinted with refreshed story rankings based on your latest signals.")
 
     return sentences[:4]
 

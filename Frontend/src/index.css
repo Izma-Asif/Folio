@@ -1,0 +1,216 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --crimson-rgb: 31 58 95;
+  --crimson-hover-rgb: 27 48 80;
+  --paper-rgb: 246 241 231;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  background-color: #F6F1E7;
+  color: #16181D;
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+/* Evening edition (dark mode) */
+.dark {
+  color-scheme: dark;
+  --crimson-rgb: 143 184 255;
+  --crimson-hover-rgb: 181 208 255;
+  --paper-rgb: 15 23 34;
+}
+.dark body {
+  background-color: #0F1722;
+  color: #EDE4CF;
+}
+
+/* Smooth theme transition */
+.theme-transition,
+.theme-transition * {
+  transition: background-color 300ms ease, color 300ms ease, border-color 300ms ease;
+}
+
+/* Double-line newspaper divider */
+.rule-double {
+  border-top: 3px double currentColor;
+}
+.rule-thin {
+  border-top: 1px solid currentColor;
+}
+
+/* Drop cap for lead stories */
+.dropcap::first-letter {
+  font-family: 'Playfair Display', serif;
+  font-weight: 900;
+  font-size: 3.6em;
+  line-height: 0.82;
+  float: left;
+  padding: 0.05em 0.12em 0 0;
+  color: #1F3A5F;
+}
+.dark .dropcap::first-letter {
+  color: #8FB8FF;
+}
+
+/* Subtle paper texture via layered gradients */
+.paper-texture {
+  background-image:
+    radial-gradient(circle at 20% 10%, rgba(31, 58, 95, 0.04), transparent 40%),
+    radial-gradient(circle at 80% 80%, rgba(22, 24, 29, 0.025), transparent 50%);
+}
+.dark .paper-texture {
+  background-image:
+    radial-gradient(circle at 20% 10%, rgba(31, 58, 95, 0.10), transparent 40%),
+    radial-gradient(circle at 80% 80%, rgba(237, 228, 207, 0.03), transparent 50%);
+}
+
+/* Halftone dot pattern behind hero */
+.halftone {
+  background-image: radial-gradient(rgba(22, 24, 29, 0.07) 1px, transparent 1.4px);
+  background-size: 7px 7px;
+}
+.dark .halftone {
+  background-image: radial-gradient(rgba(237, 228, 207, 0.06) 1px, transparent 1.4px);
+  background-size: 7px 7px;
+}
+
+/* Paper grain texture overlay */
+.paper-grain::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.35;
+  background-image:
+    radial-gradient(circle at 30% 20%, rgba(22,24,29,0.02) 0.5px, transparent 1px),
+    radial-gradient(circle at 70% 80%, rgba(22,24,29,0.015) 0.5px, transparent 1px);
+  background-size: 4px 4px, 6px 6px;
+  border-radius: inherit;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(22,24,29,0.2); border-radius: 6px; }
+.dark ::-webkit-scrollbar-thumb { background: rgba(237,228,207,0.2); }
+
+/* Marquee for the ticker */
+@keyframes ticker {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+.animate-ticker {
+  animation: ticker 40s linear infinite;
+}
+.animate-ticker:hover {
+  animation-play-state: paused;
+}
+
+/* Fade-in for page content */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-up {
+  animation: fadeUp 0.5s ease both;
+}
+
+/* Swap transition for mini-paper content changes */
+@keyframes paperSwap {
+  0% { opacity: 1; transform: translateY(0); }
+  40% { opacity: 0; transform: translateY(6px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+.animate-swap {
+  animation: paperSwap 0.45s ease both;
+}
+
+/* Toast */
+@keyframes toastIn {
+  from { opacity: 0; transform: translate(-50%, 8px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+.animate-toast {
+  animation: toastIn 0.3s ease both;
+}
+
+/* Page transition */
+@keyframes pageIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-page {
+  animation: pageIn 0.35s ease both;
+}
+
+/* Keyboard focus ring */
+*:focus-visible {
+  outline: 2px solid #1F3A5F;
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+.dark *:focus-visible {
+  outline-color: #8FB8FF;
+}
+
+/* Print styles for /paper */
+@media print {
+  /* Hide nav, toolbar, footer, and interactive elements */
+  header,
+  footer,
+  .no-print,
+  button,
+  [role="switch"],
+  input[type="range"] {
+    display: none !important;
+  }
+
+  /* Reset colors for print */
+  body {
+    background: #fff !important;
+    color: #000 !important;
+  }
+
+  .paper-texture {
+    background-image: none !important;
+  }
+
+  /* Ensure text is black on white */
+  .text-ink,
+  .text-ink\/80,
+  .text-ink\/90,
+  .text-ink\/70 {
+    color: #000 !important;
+  }
+
+  /* Expand max-width for print */
+  .max-w-broadsheet {
+    max-width: 100% !important;
+  }
+
+  /* Remove shadows and borders that waste ink */
+  .shadow-paper {
+    box-shadow: none !important;
+  }
+
+  /* Avoid breaking inside stories */
+  article {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* Ensure links show their text only */
+  a {
+    text-decoration: none !important;
+    color: #000 !important;
+  }
+}

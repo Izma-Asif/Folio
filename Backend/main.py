@@ -6,9 +6,12 @@ import logging
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 
+import time
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Response, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Response, Request, Query, BackgroundTasks
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -19,6 +22,16 @@ load_dotenv()
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("folio.main")
+
+# In-memory edition build cache: (user_id, edition_date) -> (timestamp, content)
+EDITION_BUILD_CACHE: Dict[tuple, tuple] = {}
+
+
+def clear_user_build_cache(user_id: str):
+    """Evicts any cached builds for a user after setting adjustments or interactions."""
+    keys_to_del = [k for k in EDITION_BUILD_CACHE if k[0] == user_id]
+    for k in keys_to_del:
+        EDITION_BUILD_CACHE.pop(k, None)
 
 # Import Folio modules
 from db import (
@@ -50,6 +63,7 @@ from ranker import build_edition
 from editor import apply_editor_instruction, list_user_editor_notes
 from pdf_maker import generate_edition_pdf, render_edition_html
 from ai import gemini_json
+from run_daily import run_daily_pipeline
 
 app = FastAPI(
     title="Folio API",
@@ -76,6 +90,80 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# FRIENDLY JSON ERROR HANDLERS
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    """Returns friendly, human-readable JSON error messages for HTTP exceptions."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": True,
+            "status_code": exc.status_code,
+            "message": str(exc.detail) if exc.detail else "An error occurred while processing your request.",
+            "path": str(request.url.path)
+        }
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Returns friendly JSON validation error messages."""
+    errors = []
+    for err in exc.errors():
+        loc = " -> ".join(str(l) for l in err.get("loc", []))
+        msg = err.get("msg", "Invalid value")
+        errors.append(f"{loc}: {msg}")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": True,
+            "status_code": 422,
+            "message": "Validation error in request payload: " + "; ".join(errors),
+            "details": exc.errors(),
+            "path": str(request.url.path)
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """Returns friendly JSON error messages for unhandled server exceptions."""
+    logger.error(f"Unhandled server error on {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": True,
+            "status_code": 500,
+            "message": f"Server encountered an unexpected error: {str(exc)}",
+            "path": str(request.url.path)
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# STARTUP EVENT: PRE-GENERATE SAMPLE EDITION IF DB HAS NONE
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+def pregenerate_sample_edition_if_empty():
+    """Checks if editions table has any editions; if none, builds one so demo never starts empty."""
+    try:
+        client = get_supabase()
+        res = client.table("editions").select("id").limit(1).execute()
+        if not res.data:
+            logger.info("No editions found in database on startup. Pre-generating sample edition for demo...")
+            get_or_create_user(DEFAULT_USER_ID)
+            build_edition(user_id=DEFAULT_USER_ID)
+            logger.info("Sample edition successfully pre-generated for demo.")
+        else:
+            logger.info("Existing editions found in database. Skipping sample pre-generation.")
+    except Exception as e:
+        logger.warning(f"Startup edition check/pregeneration warning: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +275,24 @@ def create_user_endpoint(req: UserCreate):
         logger.error(f"Error creating user in Supabase: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create user: {e}")
 
-    # Set topic_weights to 0.8 for chosen interests and 0.3 for all other topics
+    # Set topic_weights to 0.8 for chosen interests and 0.3 for all other topics in one batch
     chosen_interests_lower = {i.lower().strip() for i in req.interests}
+    weights_batch = []
     for topic in ALLOWED_TOPICS:
-        weight = 0.8 if topic.lower() in chosen_interests_lower else 0.3
-        update_topic_weight(user_id, topic.lower(), weight)
+        clean_topic = topic.lower().strip()
+        weight = 0.8 if clean_topic in chosen_interests_lower else 0.3
+        weights_batch.append({
+            "user_id": user_id,
+            "topic": clean_topic,
+            "weight": weight
+        })
+    try:
+        client.table("topic_weights").upsert(weights_batch, on_conflict="user_id,topic").execute()
+    except Exception as e:
+        logger.warning(f"Error batch inserting topic weights for user {user_id}: {e}")
+        # Fallback to single updates if batch upsert constraint differs
+        for row in weights_batch:
+            update_topic_weight(user_id, row["topic"], row["weight"])
 
     return {"user_id": user_id}
 
@@ -598,12 +699,30 @@ def api_generate_edition(
     user_id: str = Query(default=DEFAULT_USER_ID),
     edition_date: Optional[str] = Query(default=None)
 ):
-    """Builds (or replaces today's) personalized edition using ranker.build_edition and decays topic weights."""
-    edition_content = build_edition(user_id=user_id, edition_date=edition_date)
+    """
+    Builds (or replaces today's) personalized edition using ranker.build_edition and decays topic weights.
+    Caches build results for 60 seconds per (user_id, edition_date) to prevent duplicate builds from rapid clicks.
+    """
+    target_date = edition_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cache_key = (user_id, target_date)
+    now_ts = time.time()
+
+    # Check 60-second cache
+    cached = EDITION_BUILD_CACHE.get(cache_key)
+    if cached:
+        cache_time, cached_content = cached
+        if now_ts - cache_time < 60:
+            logger.info(f"Returning cached edition for user {user_id} on {target_date} (built {int(now_ts - cache_time)}s ago)")
+            return cached_content
+
+    edition_content = build_edition(user_id=user_id, edition_date=target_date)
     try:
         decay(user_id=user_id)
     except Exception as e:
         logger.warning(f"Failed to decay weights for user {user_id}: {e}")
+
+    # Store in 60s cache
+    EDITION_BUILD_CACHE[cache_key] = (now_ts, edition_content)
     return edition_content
 
 
@@ -718,6 +837,7 @@ def post_event(event: InteractionEvent):
         event_type=event.type,
         reason=event.reason,
     )
+    clear_user_build_cache(target_user_id)
     return result
 
 
@@ -753,10 +873,33 @@ def post_user_editor_note(user_id: str, req: EditorNoteRequest):
     """
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="Text instruction cannot be empty")
-    return apply_editor_instruction(user_id=user_id, text=req.text.strip())
+    res = apply_editor_instruction(user_id=user_id, text=req.text.strip())
+    clear_user_build_cache(user_id)
+    return res
 
 
 @app.get("/api/users/{user_id}/editor-notes")
 def get_user_editor_notes_list(user_id: str, limit: int = Query(default=20, le=50)):
     """Lists past editor notes for a user."""
     return list_user_editor_notes(user_id=user_id, limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# PIPELINE DEMO & AUTOMATION
+# ---------------------------------------------------------------------------
+
+@app.post("/api/run-daily")
+def trigger_run_daily():
+    """
+    Executes the full morning newspaper pipeline for demo purposes:
+    1. Fetches fresh RSS articles across all feeds
+    2. Scores and generates summaries with Gemini
+    3. Clusters related stories from the last 48 hours
+    4. Generates personalized daily editions for all registered users
+    """
+    try:
+        result = run_daily_pipeline()
+        return result
+    except Exception as e:
+        logger.error(f"run_daily_pipeline failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Daily pipeline execution failed: {str(e)}")

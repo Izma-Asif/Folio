@@ -47,6 +47,7 @@ from scorer import ALLOWED_TOPICS, score_new_articles, cluster_articles
 from learner import record_interaction, get_user_learning_profile, decay
 from angles import analyze_article_angles
 from ranker import build_edition
+from editor import apply_editor_instruction, list_user_editor_notes
 from pdf_maker import generate_edition_pdf, render_edition_html
 from ai import gemini_json
 
@@ -139,6 +140,10 @@ class GenerateEditionRequest(BaseModel):
 
 class CustomFeedRequest(BaseModel):
     feed_url: str
+
+
+class EditorNoteRequest(BaseModel):
+    text: str
 
 
 # ---------------------------------------------------------------------------
@@ -737,3 +742,21 @@ def get_latest_note(user_id: Optional[str] = Query(default=DEFAULT_USER_ID)):
             "parsed": {}
         }
     return note
+
+
+@app.post("/api/users/{user_id}/editor-note")
+def post_user_editor_note(user_id: str, req: EditorNoteRequest):
+    """
+    Submits a plain-language instruction to the AI Editor-in-Chief.
+    Applies topic adjustments and user settings updates, saves to editor_notes,
+    and returns {summary, applied: parsed}.
+    """
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="Text instruction cannot be empty")
+    return apply_editor_instruction(user_id=user_id, text=req.text.strip())
+
+
+@app.get("/api/users/{user_id}/editor-notes")
+def get_user_editor_notes_list(user_id: str, limit: int = Query(default=20, le=50)):
+    """Lists past editor notes for a user."""
+    return list_user_editor_notes(user_id=user_id, limit=limit)

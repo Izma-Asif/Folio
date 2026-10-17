@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ai import gemini_json
 from angles import extract_cluster_angles
+from translate import translate_edition_to_urdu  # NEW
 from db import (
     get_supabase,
     get_user,
@@ -349,7 +350,8 @@ def build_edition(user_id: str, edition_date: Optional[str] = None) -> Dict[str,
     6. Reserves 2 explore articles from low-weight topics.
     7. Respects length preference (short: ~10 articles; default: 15-20 articles).
     8. Generates 'why', 'three_things', 'masthead', 'read_minutes', and 'changes'.
-    9. Saves into Supabase editions table (replaces today's edition if it exists).
+    9. Translates to Urdu when the user's language is "ur".
+    10. Saves into Supabase editions table (replaces today's edition if it exists).
     """
     client = get_supabase()
     now_dt = datetime.now(timezone.utc)
@@ -362,6 +364,7 @@ def build_edition(user_id: str, edition_date: Optional[str] = None) -> Dict[str,
     calm_mode = user.get("calm_mode", False)
     length_pref = (user.get("length") or "medium").lower()
     depth_pref = (user.get("depth") or "balanced").lower()
+    visual_pref = (user.get("visual_mode") or "visual").lower()  # NEW
 
     # Target article counts
     is_short = (length_pref == "short")
@@ -410,6 +413,10 @@ def build_edition(user_id: str, edition_date: Optional[str] = None) -> Dict[str,
                 base_score *= 0.30  # Heavily de-prioritize heavy tone
             elif tone == "light":
                 base_score *= 1.25  # Boost light tone
+
+        # NEW: visual readers prefer stories that have a picture
+        if visual_pref == "visual" and art.get("image_url"):
+            base_score += 0.08
 
         scored_art = dict(art)
         scored_art["_score"] = round(base_score, 4)
@@ -591,6 +598,10 @@ def build_edition(user_id: str, edition_date: Optional[str] = None) -> Dict[str,
         "three_things": three_things,
         "changes": changes
     }
+
+    # 13b. NEW: Urdu edition (falls back to English silently if translation fails)
+    if (user.get("language") or "en").lower() == "ur":
+        edition_content = translate_edition_to_urdu(edition_content)
 
     # 14. Save in editions table: replace today's edition if it exists
     try:

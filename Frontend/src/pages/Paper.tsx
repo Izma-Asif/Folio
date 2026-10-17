@@ -1,8 +1,16 @@
 import { useEffect, useState } from 'react';
-import { CloudSun, Download, Printer, RefreshCw, AlertCircle } from 'lucide-react';
+import { CloudSun, Download, Languages, PenLine, Printer, RefreshCw, AlertCircle } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import type { Edition } from '@/types';
-import { generateEdition, getPdfUrl, getEditions, trackEvent, getUser } from '@/api';
+import type { Edition, Language } from '@/types';
+import {
+  generateEdition,
+  getPdfUrl,
+  getEditions,
+  trackEvent,
+  getUser,
+  updatePreferences,
+  sendEditorNote,
+} from '@/api';
 import Masthead from '@/components/Masthead';
 import StoryCard from '@/components/StoryCard';
 import { PaperSkeleton } from '@/components/Skeleton';
@@ -12,7 +20,30 @@ export default function Paper() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
+    const [note, setNote] = useState('');
+  const [noteMsg, setNoteMsg] = useState<string | null>(null);
+
+  const handleNote = async () => {
+    const text = note.trim();
+    if (!text) return;
+    setGenerating(true);
+    setNoteMsg(null);
+    try {
+      const res = await sendEditorNote({ message: text } as any);
+      setNoteMsg(res.summary || 'Got it. Your editor will adjust tomorrow\u2019s paper.');
+      setNote('');
+      const currentLang = edition?.language === 'ur' ? 'ur' : undefined;
+      const ed = await generateEdition(currentLang as any);
+      setEdition(ed);
+    } catch {
+      setNoteMsg('Your editor could not take that note right now. Try again.');
+    } finally {
+      setGenerating(false);
+    }
+  };
   const user = getUser();
+  const isUrdu = edition?.language === 'ur';
+  const showImages = user?.visual_mode !== 'reader';
 
   useEffect(() => {
     let active = true;
@@ -40,10 +71,24 @@ export default function Paper() {
   const handleRegenerate = async () => {
     setGenerating(true);
     try {
-      const ed = await generateEdition();
+      const currentLang = edition?.language === 'ur' ? 'ur' : undefined;
+      const ed = await generateEdition(currentLang as any);
       setEdition(ed);
     } catch {
       setError('Could not regenerate. Please try again.');
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const handleLanguage = async (lang: Language) => {
+    setGenerating(true);
+    try {
+      await updatePreferences({ language: lang });
+      const ed = await generateEdition(lang);
+      setEdition(ed);
+    } catch {
+      setError('Could not switch language. Please try again.');
     } finally {
       setGenerating(false);
     }
@@ -112,6 +157,9 @@ export default function Paper() {
   const opinion = edition.stories.find((s) => s.kind === 'opinion');
   const briefs = edition.stories.filter((s) => s.kind === 'brief');
 
+  const btn =
+    'inline-flex items-center gap-1.5 rounded-full border border-ink/20 px-3 py-1.5 font-ui text-xs uppercase tracking-wider text-ink transition-colors hover:bg-ink hover:text-paper disabled:opacity-50 dark:border-crimson/50 dark:text-crimson dark:hover:bg-crimson dark:hover:text-paper';
+
   return (
     <div className="paper-texture pb-20">
       <div className="mx-auto max-w-broadsheet px-4 py-10 sm:px-6">
@@ -126,26 +174,24 @@ export default function Paper() {
               {edition.weather.low}°
             </span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
-              onClick={handleRegenerate}
+              onClick={() => handleLanguage(isUrdu ? 'en' : 'ur')}
               disabled={generating}
-              className="inline-flex items-center gap-1.5 rounded-full border border-ink/20 px-3 py-1.5 font-ui text-xs uppercase tracking-wider text-ink transition-colors hover:bg-ink hover:text-paper disabled:opacity-50 dark:border-crimson/50 dark:text-crimson dark:hover:bg-crimson dark:hover:text-paper"
+              className={btn}
             >
+              <Languages className="h-3.5 w-3.5" />
+              {isUrdu ? 'ENGLISH' : 'اردو'}
+            </button>
+            <button onClick={handleRegenerate} disabled={generating} className={btn}>
               <RefreshCw className={`h-3.5 w-3.5 ${generating ? 'animate-spin' : ''}`} />
               {generating ? 'Reprinting' : 'Regenerate'}
             </button>
-            <button
-              onClick={handlePrint}
-              className="inline-flex items-center gap-1.5 rounded-full border border-ink/20 px-3 py-1.5 font-ui text-xs uppercase tracking-wider text-ink transition-colors hover:bg-ink hover:text-paper dark:border-crimson/50 dark:text-crimson dark:hover:bg-crimson dark:hover:text-paper"
-            >
+            <button onClick={handlePrint} className={btn}>
               <Printer className="h-3.5 w-3.5" />
               Print
             </button>
-            <button
-              onClick={handlePdf}
-              className="inline-flex items-center gap-1.5 rounded-full border border-ink/20 px-3 py-1.5 font-ui text-xs uppercase tracking-wider text-ink transition-colors hover:bg-ink hover:text-paper dark:border-crimson/50 dark:text-crimson dark:hover:bg-crimson dark:hover:text-paper"
-            >
+            <button onClick={handlePdf} className={btn}>
               <Download className="h-3.5 w-3.5" />
               PDF
             </button>
@@ -167,45 +213,85 @@ export default function Paper() {
             </div>
           </div>
         </div>
-
-        {/* Editor's note */}
-        <p className="mt-6 max-w-2xl font-body text-sm italic leading-relaxed text-ink/70 dark:text-cream-ink/95">
-          <span className="font-ui not-italic text-[11px] uppercase tracking-[0.2em] text-crimson">
-            From the editor ·{' '}
-          </span>
-          {edition.editorNote}
-        </p>
-
-        {/* Lead */}
-        <div className="mt-8">
-          <StoryCard story={lead} variant="lead" />
-        </div>
-
-        <div className="my-10 rule-double border-ink/80 dark:border-cream-ink/80" />
-
-        {/* Standard stories grid */}
-        <div className="grid gap-10 md:grid-cols-2 md:gap-x-12 md:gap-y-10">
-          {standards.map((s) => (
-            <StoryCard key={s.id} story={s} variant="standard" />
-          ))}
-        </div>
-
-        {/* Briefs + Opinion */}
-        <div className="my-10 rule-thin border-ink/20 dark:border-cream-ink/20" />
-
-        <div className="grid gap-10 md:grid-cols-3">
-          <div className="md:col-span-1">
-            <h3 className="font-display text-xl font-black uppercase tracking-tight text-ink dark:text-cream-ink">
-              In Brief
-            </h3>
-            <div className="mt-3 divide-y divide-ink/15 dark:divide-cream-ink/15">
-              {briefs.map((b) => (
-                <StoryCard key={b.id} story={b} variant="brief" />
-              ))}
-            </div>
+        {/* Translation error banner */}
+        {edition.translationError && (
+          <div className="no-print mt-4 flex items-center gap-2 rounded-lg border border-amber-400/50 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-900/20 dark:text-amber-200">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            {edition.translationError}
           </div>
-          <div className="md:col-span-2">
-            {opinion && <StoryCard story={opinion} variant="opinion" />}
+        )}
+        {/* Tell your editor */}
+        <div className="no-print mt-4 rounded-lg border border-ink/15 p-4 dark:border-cream-ink/15">
+          <label className="block">
+            <span className="inline-flex items-center gap-2 font-ui text-xs font-semibold uppercase tracking-wider text-ink/60 dark:text-cream-ink/95">
+              <PenLine className="h-3.5 w-3.5" />
+              Tell your editor
+            </span>
+            <div className="mt-2 flex gap-2">
+              <input
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleNote()}
+                disabled={generating}
+                placeholder="e.g. less politics, more startups, keep it short"
+                className="w-full rounded-md border border-ink/20 bg-paper/50 px-4 py-2.5 font-body text-sm text-ink outline-none focus:border-crimson dark:border-crimson/40 dark:bg-navy-2/40 dark:text-cream-ink"
+              />
+              <button
+                onClick={handleNote}
+                disabled={generating || !note.trim()}
+                className="shrink-0 rounded-full bg-crimson px-5 py-2.5 font-ui text-xs font-semibold uppercase tracking-wider text-paper transition-all disabled:opacity-40 enabled:hover:bg-crimson-hover"
+              >
+                {generating ? 'Updating\u2026' : 'Send'}
+              </button>
+            </div>
+          </label>
+          {noteMsg && (
+            <p className="mt-2 font-body text-sm italic text-ink/70 dark:text-cream-ink/95">
+              {noteMsg}
+            </p>
+          )}
+        </div>
+        {/* Everything below follows the reader's language direction */}
+        <div dir={isUrdu ? 'rtl' : 'ltr'} lang={isUrdu ? 'ur' : 'en'}>
+          {/* Editor's note */}
+          <p className="mt-6 max-w-2xl font-body text-sm italic leading-relaxed text-ink/70 dark:text-cream-ink/95">
+            <span className="font-ui not-italic text-[11px] uppercase tracking-[0.2em] text-crimson">
+              From the editor ·{' '}
+            </span>
+            {edition.editorNote}
+          </p>
+
+          {/* Lead */}
+          <div className="mt-8">
+            <StoryCard story={lead} variant="lead" showImages={showImages} />
+          </div>
+
+          <div className="my-10 rule-double border-ink/80 dark:border-cream-ink/80" />
+
+          {/* Standard stories grid */}
+          <div className="grid gap-10 md:grid-cols-2 md:gap-x-12 md:gap-y-10">
+            {standards.map((s) => (
+              <StoryCard key={s.id} story={s} variant="standard" showImages={showImages} />
+            ))}
+          </div>
+
+          {/* Briefs + Opinion */}
+          <div className="my-10 rule-thin border-ink/20 dark:border-cream-ink/20" />
+
+          <div className="grid gap-10 md:grid-cols-3">
+            <div className="md:col-span-1">
+              <h3 className="font-display text-xl font-black uppercase tracking-tight text-ink dark:text-cream-ink">
+                {isUrdu ? 'مختصر خبریں' : 'In Brief'}
+              </h3>
+              <div className="mt-3 divide-y divide-ink/15 dark:divide-cream-ink/15">
+                {briefs.map((b) => (
+                  <StoryCard key={b.id} story={b} variant="brief" showImages={false} />
+                ))}
+              </div>
+            </div>
+            <div className="md:col-span-2">
+              {opinion && <StoryCard story={opinion} variant="opinion" showImages={false} />}
+            </div>
           </div>
         </div>
 

@@ -35,6 +35,7 @@ export interface Story {
   readingTime: number;
   tags: string[];
   imageUrl?: string;
+  link?: string;
 }
 
 export interface Edition {
@@ -45,6 +46,8 @@ export interface Edition {
   ticker: string[];
   stories: Story[];
   editorNote: string;
+  language?: 'en' | 'ur';
+  translationError?: string;
 }
 
 export interface InterestWeight {

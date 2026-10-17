@@ -251,6 +251,7 @@ function articleToStory(
     readingTime: Math.max(1, Math.round((dek.length + 120) / 200)),
     tags: [a.topic?.toLowerCase(), a.tone].filter(Boolean),
     imageUrl: a.image_url || undefined,
+     link: a.link || undefined,
   };
 }
 
@@ -342,6 +343,8 @@ function mapEdition(raw: any): Edition {
     ticker,
     stories,
     editorNote,
+    language: raw.language || 'en',
+    translationError: raw.translation_error || undefined,
   };
 }
 
@@ -403,9 +406,10 @@ export async function getEdition(id: string): Promise<Edition | null> {
   }
 }
 
-export async function generateEdition(): Promise<Edition> {
+export async function generateEdition(lang?: Language): Promise<Edition> {
   const userId = getUserId();
-  const raw = await apiFetch<any>(`/api/editions/generate?user_id=${encodeURIComponent(userId)}`, {
+  const langParam = lang && lang !== 'en' ? `&lang=${encodeURIComponent(lang)}` : '';
+  const raw = await apiFetch<any>(`/api/editions/generate?user_id=${encodeURIComponent(userId)}${langParam}`, {
     method: 'POST',
   });
 
@@ -429,9 +433,10 @@ export async function trackEvent(
   const userId = getUserId();
   let type: 'click' | 'save' | 'skip' = 'click';
 
-  if (event.type === 'skip') {
+    const evType = event.type as string;
+  if (evType === 'skip') {
     type = 'skip';
-  } else if (event.type === 'share' || (event.type as any) === 'save') {
+  } else if (evType === 'share' || evType === 'save') {
     type = 'save';
   } else {
     type = 'click';
@@ -574,6 +579,7 @@ export async function updatePreferences(input: {
   calm_mode?: boolean;
   visual_mode?: VisualMode;
   interests?: string[];
+  language?: Language;
 }): Promise<UserProfile | null> {
   const userId = getUserId();
   try {
@@ -601,6 +607,7 @@ export async function updatePreferences(input: {
       calm_mode: res.calm_mode ?? input.calm_mode ?? current.calm_mode,
       visual_mode: res.visual_mode ?? input.visual_mode ?? current.visual_mode,
       interests: res.interests ?? input.interests ?? current.interests,
+      language: (res.language ?? input.language ?? current.language) as Language,
     };
 
     setUser(updated);

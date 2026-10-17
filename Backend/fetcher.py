@@ -3,7 +3,7 @@ import email.utils
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import feedparser
 import httpx
@@ -28,6 +28,100 @@ def strip_html(raw_html: str) -> str:
     except Exception:
         clean = re.sub(r"<[^>]+>", " ", raw_html)
         return " ".join(clean.split())
+
+
+def fetch_article_meta_image(url: str) -> Optional[str]:
+    """
+    Fetches the article page with httpx (5-second timeout, browser-like User-Agent,
+    following redirects) and reads the og:image or twitter:image meta tag.
+    Ignores failures and returns None if unfound.
+    """
+    if not url or not url.startswith("http"):
+        return None
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Folio/1.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+        }
+        with httpx.Client(timeout=5.0, follow_redirects=True, headers=headers) as client:
+            resp = client.get(url)
+            if resp.status_code != 200:
+                return None
+            html = resp.text
+
+        soup = BeautifulSoup(html, "html.parser")
+        # Try og:image and twitter:image variants
+        meta_tags = [
+            soup.find("meta", property="og:image"),
+            soup.find("meta", attrs={"name": "og:image"}),
+            soup.find("meta", property="twitter:image"),
+            soup.find("meta", attrs={"name": "twitter:image"}),
+            soup.find("meta", property="twitter:image:src"),
+            soup.find("meta", attrs={"name": "twitter:image:src"})
+        ]
+        for tag in meta_tags:
+            if tag and tag.get("content"):
+                src = tag["content"].strip()
+                if src.startswith("http://") or src.startswith("https://"):
+                    return src
+        return None
+    except Exception as e:
+        logger.debug(f"fetch_article_meta_image failed for {url}: {e}")
+        return None
+
+
+def backfill_missing_images(limit: int = 60) -> int:
+    """
+    Concurrently finds up to `limit` newest articles in the articles table
+    missing an image_url, scrapes og:image / twitter:image meta tags,
+    ignores failures, and saves results to the articles table.
+    """
+    client = get_supabase()
+    try:
+        # Fetch newest articles without image_url
+        res = (
+            client.table("articles")
+            .select("id, link, image_url")
+            .order("created_at", desc=True)
+            .limit(limit * 3)
+            .execute()
+        )
+        candidates = [
+            a for a in (res.data or [])
+            if not a.get("image_url") and a.get("link")
+        ][:limit]
+    except Exception as e:
+        logger.warning(f"Error querying articles for image backfill: {e}")
+        return 0
+
+    if not candidates:
+        logger.info("backfill_missing_images: no articles missing image_url found.")
+        return 0
+
+    updated_count = 0
+
+    def process_article(art: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        art_id = art["id"]
+        link = art["link"]
+        img = fetch_article_meta_image(link)
+        if img:
+            return (art_id, img)
+        return None
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(process_article, art) for art in candidates]
+        for fut in as_completed(futures):
+            try:
+                result = fut.result()
+                if result:
+                    art_id, img_url = result
+                    client.table("articles").update({"image_url": img_url}).eq("id", art_id).execute()
+                    updated_count += 1
+            except Exception as up_err:
+                logger.debug(f"Failed updating article image: {up_err}")
+
+    logger.info(f"backfill_missing_images completed: found & updated {updated_count}/{len(candidates)} article images.")
+    return updated_count
 
 
 def extract_image_url(entry: Any, raw_summary: str) -> Optional[str]:
@@ -240,6 +334,13 @@ def fetch_all() -> Dict[str, Any]:
                 articles_saved += len(res.data)
         except Exception as up_err:
             logger.debug(f"Batch article upsert error: {up_err}")
+
+    # Run image backfill for missing images
+    try:
+        backfilled = backfill_missing_images(limit=60)
+        logger.info(f"fetch_all image backfill updated {backfilled} articles.")
+    except Exception as bf_err:
+        logger.warning(f"Error running image backfill at end of fetch_all: {bf_err}")
 
     logger.info(f"fetch_all completed. Articles saved: {articles_saved}, Failed feeds: {len(failed_feeds)}")
     return {

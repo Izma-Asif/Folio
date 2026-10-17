@@ -26,7 +26,7 @@ import {
   CloudRain,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import { createUser, inferInterests, listAllInterests } from '@/api';
+import { createUser, inferInterests, listAllInterests, sendEditorNote } from '@/api';
 import type { Language, VisualMode } from '@/types';
 
 const STORAGE_KEY = 'folio_user_id';
@@ -98,6 +98,13 @@ export default function Onboarding() {
         visual_mode: visualMode,
       });
       window.localStorage.setItem(STORAGE_KEY, user.id);
+            if (editorNote.trim()) {
+        try {
+          await sendEditorNote({ message: editorNote.trim() } as any);
+        } catch {
+          // the note is optional, so ignore failures
+        }
+      }
       navigate('/paper');
     } catch {
       setError('Something went wrong printing your edition. Try again.');
@@ -347,7 +354,7 @@ export default function Onboarding() {
                 active={language === 'ur'}
                 onClick={() => setLanguage('ur')}
                 label="اردو"
-                sub="Urdu edition (label only for now)."
+                sub="Urdu edition: headlines and summaries."
               />
             </div>
 

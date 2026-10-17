@@ -37,6 +37,7 @@ from sources import (
     add_custom_feed_for_user,
 )
 from fetcher import fetch_all, ingest_all_sources
+from scorer import score_new_articles, cluster_articles
 from learner import record_interaction, get_user_learning_profile
 from angles import analyze_article_angles
 from editor import generate_daily_edition
@@ -188,6 +189,21 @@ def api_fetch():
     Returns the number of articles saved and the list of feeds that failed.
     """
     return fetch_all()
+
+
+@app.post("/api/score")
+def api_score():
+    """
+    Categorizes unscored articles in batches of 10 using Gemini (or fallback),
+    and clusters articles from the last 48 hours sharing the same story.
+    """
+    scoring_res = score_new_articles()
+    clustering_res = cluster_articles()
+    return {
+        "status": "success",
+        "scoring": scoring_res,
+        "clustering": clustering_res
+    }
 
 
 @app.post("/api/sources/fetch")

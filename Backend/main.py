@@ -63,6 +63,7 @@ from ranker import build_edition
 from editor import apply_editor_instruction, list_user_editor_notes
 from pdf_maker import generate_edition_pdf, render_edition_html
 from ai import gemini_json
+from translate import translate_edition_to_urdu, get_cached_translation
 from run_daily import run_daily_pipeline
 
 app = FastAPI(
@@ -343,6 +344,7 @@ def patch_user(user_id: str, updates: UserPatch):
     weights = get_topic_weights(user_id)
     result = dict(user)
     result["topic_weights"] = weights
+    clear_user_build_cache(user_id)
     return result
 
 
@@ -697,11 +699,13 @@ def get_article_angles(article_id: str):
 @app.post("/api/editions/generate")
 def api_generate_edition(
     user_id: str = Query(default=DEFAULT_USER_ID),
-    edition_date: Optional[str] = Query(default=None)
+    edition_date: Optional[str] = Query(default=None),
+    lang: Optional[str] = Query(default=None),
 ):
     """
     Builds (or replaces today's) personalized edition using ranker.build_edition and decays topic weights.
     Caches build results for 60 seconds per (user_id, edition_date) to prevent duplicate builds from rapid clicks.
+    When lang=ur, translates the edition to Urdu via Gemini (cached per edition id).
     """
     target_date = edition_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cache_key = (user_id, target_date)
@@ -713,16 +717,35 @@ def api_generate_edition(
         cache_time, cached_content = cached
         if now_ts - cache_time < 60:
             logger.info(f"Returning cached edition for user {user_id} on {target_date} (built {int(now_ts - cache_time)}s ago)")
-            return cached_content
+            edition_content = cached_content
+        else:
+            edition_content = None
+    else:
+        edition_content = None
 
-    edition_content = build_edition(user_id=user_id, edition_date=target_date)
-    try:
-        decay(user_id=user_id)
-    except Exception as e:
-        logger.warning(f"Failed to decay weights for user {user_id}: {e}")
+    if edition_content is None:
+        edition_content = build_edition(user_id=user_id, edition_date=target_date)
+        try:
+            decay(user_id=user_id)
+        except Exception as e:
+            logger.warning(f"Failed to decay weights for user {user_id}: {e}")
+        # Store in 60s cache
+        EDITION_BUILD_CACHE[cache_key] = (now_ts, edition_content)
 
-    # Store in 60s cache
-    EDITION_BUILD_CACHE[cache_key] = (now_ts, edition_content)
+    # Urdu translation
+    if lang == "ur":
+        logger.info(f"Urdu translation requested for user {user_id}")
+        translated, success = translate_edition_to_urdu(edition_content)
+        if success:
+            return translated
+        else:
+            # Return English with a translation_error flag
+            result = dict(edition_content) if isinstance(edition_content, dict) else edition_content
+            if isinstance(result, dict):
+                result["language"] = "en"
+                result["translation_error"] = "Urdu translation unavailable right now, showing English."
+            return result
+
     return edition_content
 
 

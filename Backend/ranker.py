@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ai import gemini_json
+from angles import extract_cluster_angles
 from db import (
     get_supabase,
     get_user,
@@ -379,8 +380,11 @@ def build_edition(user_id: str, edition_date: Optional[str] = None) -> Dict[str,
     # 5. Cluster grouping: one article per cluster_id (keep best), gather also_covered_by & angles
     cluster_buckets: Dict[str, List[Dict[str, Any]]] = {}
     for art in scored_pool:
-        cid = art.get("cluster_id") or art["id"]
+        cid = str(art.get("cluster_id") or art["id"])
         cluster_buckets.setdefault(cid, []).append(art)
+
+    # Call Gemini once in batch for all clusters with 2 or more sources (skips silently on failure)
+    ai_cluster_angles = extract_cluster_angles(cluster_buckets)
 
     deduped_candidates: List[Dict[str, Any]] = []
     for cid, members in cluster_buckets.items():
@@ -394,14 +398,18 @@ def build_edition(user_id: str, edition_date: Optional[str] = None) -> Dict[str,
             if m.get("source") and m.get("source") != best.get("source")
         ))
 
-        # Perspective angles from other articles in the cluster
-        cluster_angles = [
-            {
-                "source": m.get("source", "Other Coverage"),
-                "focus": (m.get("ai_summary") or m.get("summary") or m.get("title", ""))[:130]
-            }
-            for m in members if m["id"] != best["id"]
-        ][:3]
+        # Distinct sources count across all members in this cluster
+        distinct_sources = list(dict.fromkeys(
+            m.get("source", "").strip() for m in members
+            if m.get("source") and m.get("source").strip()
+        ))
+
+        # Only attach angles for clusters with 2 or more sources
+        if len(distinct_sources) >= 2:
+            # Use Gemini angles if available; otherwise skip (or empty list)
+            cluster_angles = ai_cluster_angles.get(cid, [])
+        else:
+            cluster_angles = []
 
         best["_also_covered_by"] = other_sources
         best["_angles"] = cluster_angles

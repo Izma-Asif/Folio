@@ -44,9 +44,10 @@ from sources import (
 )
 from fetcher import fetch_all, ingest_all_sources
 from scorer import ALLOWED_TOPICS, score_new_articles, cluster_articles
-from learner import record_interaction, get_user_learning_profile
+from learner import record_interaction, get_user_learning_profile, decay
 from angles import analyze_article_angles
 from ranker import build_edition
+from editor import apply_editor_instruction, list_user_editor_notes
 from pdf_maker import generate_edition_pdf, render_edition_html
 from ai import gemini_json
 
@@ -124,8 +125,11 @@ class WeightUpdate(BaseModel):
 class InteractionEvent(BaseModel):
     user_id: Optional[str] = DEFAULT_USER_ID
     article_id: Optional[str] = None
-    event_type: str  # read, thumbs_up, thumbs_down, bookmark, skip
-    reason: Optional[str] = None
+    type: str = Field(..., pattern="^(click|save|skip)$")
+    reason: Optional[str] = Field(
+        default=None,
+        description="Required context for skip: not_interested | already_know | too_negative"
+    )
 
 
 class GenerateEditionRequest(BaseModel):
@@ -136,6 +140,10 @@ class GenerateEditionRequest(BaseModel):
 
 class CustomFeedRequest(BaseModel):
     feed_url: str
+
+
+class EditorNoteRequest(BaseModel):
+    text: str
 
 
 # ---------------------------------------------------------------------------
@@ -258,8 +266,65 @@ def update_user_profile(user_id: str, updates: UserUpdate):
 
 @app.get("/api/users/{user_id}/weights")
 def get_weights(user_id: str):
-    """Gets personalized topic weights for user."""
-    return get_topic_weights(user_id)
+    """
+    Returns topic weights sorted high → low, plus the last 10 interaction
+    events enriched with their article titles for an activity list.
+    """
+    client = get_supabase()
+
+    # Sorted weights
+    raw_weights = get_topic_weights(user_id)
+    sorted_weights = dict(
+        sorted(raw_weights.items(), key=lambda x: x[1], reverse=True)
+    )
+
+    # Last 10 events with article title lookup
+    try:
+        evt_res = (
+            client.table("events")
+            .select("id, type, reason, article_id, created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+        events = evt_res.data or []
+    except Exception:
+        events = []
+
+    # Batch-fetch article titles in one query
+    article_ids = list({e["article_id"] for e in events if e.get("article_id")})
+    title_map: Dict[str, str] = {}
+    if article_ids:
+        try:
+            art_res = (
+                client.table("articles")
+                .select("id, title")
+                .in_("id", article_ids)
+                .execute()
+            )
+            for row in (art_res.data or []):
+                title_map[str(row["id"])] = row.get("title", "")
+        except Exception:
+            pass
+
+    activity = [
+        {
+            "id": e.get("id"),
+            "type": e.get("type"),
+            "reason": e.get("reason"),
+            "article_id": e.get("article_id"),
+            "article_title": title_map.get(str(e.get("article_id", "")), ""),
+            "created_at": e.get("created_at"),
+        }
+        for e in events
+    ]
+
+    return {
+        "user_id": user_id,
+        "weights": sorted_weights,
+        "activity": activity,
+    }
 
 
 @app.post("/api/users/{user_id}/weights")
@@ -533,8 +598,12 @@ def api_generate_edition(
     user_id: str = Query(default=DEFAULT_USER_ID),
     edition_date: Optional[str] = Query(default=None)
 ):
-    """Builds (or replaces today's) personalized edition using ranker.build_edition."""
+    """Builds (or replaces today's) personalized edition using ranker.build_edition and decays topic weights."""
     edition_content = build_edition(user_id=user_id, edition_date=edition_date)
+    try:
+        decay(user_id=user_id)
+    except Exception as e:
+        logger.warning(f"Failed to decay weights for user {user_id}: {e}")
     return edition_content
 
 
@@ -628,13 +697,26 @@ def download_edition_pdf(edition_id: str):
 
 @app.post("/api/events")
 def post_event(event: InteractionEvent):
-    """Logs reader telemetry and updates personalized preference weights."""
+    """
+    Logs a reader interaction and updates topic weights.
+
+    Body: {user_id?, article_id?, type: 'click'|'save'|'skip', reason?}
+
+    Weight deltas:
+      click          +0.05
+      save           +0.15
+      skip + not_interested  -0.20
+      skip + already_know    -0.05
+      skip + too_negative    -0.10  (auto-enables calm_mode after 3× in 7 days)
+
+    Weights clamped to [0.05, 1.0].
+    """
     target_user_id = event.user_id or DEFAULT_USER_ID
     result = record_interaction(
         user_id=target_user_id,
         article_id=event.article_id,
-        event_type=event.event_type,
-        reason=event.reason
+        event_type=event.type,
+        reason=event.reason,
     )
     return result
 
@@ -660,3 +742,21 @@ def get_latest_note(user_id: Optional[str] = Query(default=DEFAULT_USER_ID)):
             "parsed": {}
         }
     return note
+
+
+@app.post("/api/users/{user_id}/editor-note")
+def post_user_editor_note(user_id: str, req: EditorNoteRequest):
+    """
+    Submits a plain-language instruction to the AI Editor-in-Chief.
+    Applies topic adjustments and user settings updates, saves to editor_notes,
+    and returns {summary, applied: parsed}.
+    """
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="Text instruction cannot be empty")
+    return apply_editor_instruction(user_id=user_id, text=req.text.strip())
+
+
+@app.get("/api/users/{user_id}/editor-notes")
+def get_user_editor_notes_list(user_id: str, limit: int = Query(default=20, le=50)):
+    """Lists past editor notes for a user."""
+    return list_user_editor_notes(user_id=user_id, limit=limit)

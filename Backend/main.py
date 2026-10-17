@@ -343,6 +343,7 @@ def patch_user(user_id: str, updates: UserPatch):
     weights = get_topic_weights(user_id)
     result = dict(user)
     result["topic_weights"] = weights
+    clear_user_build_cache(user_id)
     return result
 
 

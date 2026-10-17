@@ -1,3 +1,22 @@
+"""
+angles.py – Multi-source perspective and emphasis extraction for Folio.
+
+For each cluster of articles with 2 or more distinct sources inside an edition,
+calls Gemini once (batching all multi-source clusters in a single API call)
+with each source's title and summary.
+
+For each cluster, returns per source one neutral short phrase describing what that
+source emphasizes, e.g.:
+    {"source": "Dawn", "focus": "the budget numbers"}
+
+Rules:
+- Do not judge accuracy.
+- Do not label any source biased.
+- Describe emphasis only.
+- Skip silently if Gemini fails.
+"""
+
+import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
@@ -6,6 +25,105 @@ from db import get_article
 
 logger = logging.getLogger("folio.angles")
 
+
+def extract_cluster_angles(
+    clusters: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, List[Dict[str, str]]]:
+    """
+    Takes a dictionary mapping cluster_id -> list of article dicts in that cluster.
+    Filters for clusters with 2 or more distinct sources.
+    Batches all such clusters into a single Gemini prompt.
+
+    Returns a dict mapping cluster_id -> list of {"source": str, "focus": str}.
+    If Gemini fails or returns malformed output, returns an empty dict (skips silently).
+    """
+    # 1. Filter for clusters with 2 or more distinct sources
+    valid_clusters: Dict[str, List[Dict[str, Any]]] = {}
+    for cid, members in clusters.items():
+        distinct_sources = list(dict.fromkeys(
+            (m.get("source") or "").strip()
+            for m in members
+            if (m.get("source") or "").strip()
+        ))
+        if len(distinct_sources) >= 2:
+            valid_clusters[str(cid)] = members
+
+    if not valid_clusters:
+        return {}
+
+    # 2. Build structured text representation of all clusters
+    cluster_blocks: List[str] = []
+    for idx, (cid, members) in enumerate(valid_clusters.items(), start=1):
+        # Deduplicate members by source to present one representative headline/summary per source
+        seen_sources = set()
+        source_lines: List[str] = []
+        for m in members:
+            src = (m.get("source") or "Unknown").strip()
+            if src in seen_sources:
+                continue
+            seen_sources.add(src)
+            title = (m.get("title") or "").strip()
+            summary = (m.get("ai_summary") or m.get("summary") or "")[:200].strip()
+            source_lines.append(f'  - Source: "{src}" | Headline: "{title}" | Summary: "{summary}"')
+
+        block = f'Cluster ID "{cid}":\n' + "\n".join(source_lines)
+        cluster_blocks.append(block)
+
+    prompt = f"""You are an objective media analysis engine.
+Below are news story clusters where multiple news sources reported on the same overarching topic or event.
+
+For each cluster, analyze what each reporting source chooses to emphasize.
+For every source in each cluster, write ONE neutral, factual, short phrase describing what that specific source emphasizes (e.g. "the budget numbers", "eyewitness accounts", "diplomatic reactions", "economic implications").
+
+STRICT GUIDELINES:
+1. Do NOT judge accuracy or factuality.
+2. Do NOT label any source as biased, partisan, unreliable, or slanted.
+3. Describe emphasis ONLY.
+4. Keep each focus phrase short (3 to 8 words).
+
+Clusters to analyze:
+{chr(10).join(cluster_blocks)}
+
+Return ONLY a valid JSON object mapping each cluster ID string to an array of objects with "source" and "focus" keys.
+Example format:
+{{
+  "cluster_id_1": [
+    {{"source": "Dawn", "focus": "the budget numbers and deficit"}},
+    {{"source": "Express Tribune", "focus": "parliamentary debate reactions"}}
+  ]
+}}
+"""
+
+    try:
+        res = gemini_json(prompt)
+        if not isinstance(res, dict):
+            logger.debug("extract_cluster_angles: Gemini returned non-dict response")
+            return {}
+
+        results: Dict[str, List[Dict[str, str]]] = {}
+        for cid, angle_list in res.items():
+            cid_str = str(cid)
+            if not isinstance(angle_list, list):
+                continue
+            cleaned_angles: List[Dict[str, str]] = []
+            for item in angle_list:
+                if isinstance(item, dict) and "source" in item and "focus" in item:
+                    cleaned_angles.append({
+                        "source": str(item["source"]).strip(),
+                        "focus": str(item["focus"]).strip()
+                    })
+            if cleaned_angles:
+                results[cid_str] = cleaned_angles
+
+        return results
+    except Exception as e:
+        logger.debug(f"extract_cluster_angles failed silently: {e}")
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Single-article 360-degree breakdown (preserved for GET /api/articles/{id}/angles)
+# ---------------------------------------------------------------------------
 
 def generate_fallback_angles(title: str, summary: str, topic: str) -> Dict[str, Any]:
     """Generates structured heuristics when AI call is not reachable."""
@@ -44,8 +162,7 @@ def generate_fallback_angles(title: str, summary: str, topic: str) -> Dict[str, 
 
 def analyze_article_angles(article_id_or_data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Produces a multi-perspective editorial breakdown of an article,
-    revealing conflicting viewpoints, counterarguments, and reader implications.
+    Produces a 360-degree multi-perspective breakdown of an individual article.
     """
     if isinstance(article_id_or_data, str):
         article = get_article(article_id_or_data)
@@ -95,7 +212,6 @@ Return a JSON object with strictly these keys:
         result["article_id"] = article.get("id")
         return result
 
-    # Fallback heuristic
     fallback = generate_fallback_angles(title, summary, topic)
     fallback["article_id"] = article.get("id")
     return fallback

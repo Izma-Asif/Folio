@@ -162,9 +162,9 @@ def score_new_articles() -> Dict[str, Any]:
     """
     client = get_supabase()
     
-    # 1. Fetch articles where topic is null
+    # 1. Fetch articles where topic is null (limit to top 30 to prevent timeout)
     try:
-        res = client.table("articles").select("id, title, summary, source, topic, tone").is_("topic", "null").order("created_at", desc=True).execute()
+        res = client.table("articles").select("id, title, summary, source, topic, tone").is_("topic", "null").order("created_at", desc=True).limit(30).execute()
         unscored_articles = res.data or []
     except Exception as e:
         logger.error(f"Error fetching unscored articles: {e}")
@@ -390,14 +390,16 @@ def cluster_articles() -> Dict[str, Any]:
             single_id = member_ids[0]
             updates[single_id] = f"cluster_{single_id[:8]}"
 
-    # 5. Save shared cluster_ids to articles table
+    # 5. Save shared cluster_ids to articles table (only for articles where it actually changed)
+    existing_cids = {art["id"]: art.get("cluster_id") for art in articles}
     updated_count = 0
     for art_id, cid in updates.items():
-        try:
-            client.table("articles").update({"cluster_id": cid}).eq("id", art_id).execute()
-            updated_count += 1
-        except Exception as e:
-            logger.debug(f"Error updating cluster_id for {art_id}: {e}")
+        if existing_cids.get(art_id) != cid:
+            try:
+                client.table("articles").update({"cluster_id": cid}).eq("id", art_id).execute()
+                updated_count += 1
+            except Exception as e:
+                logger.debug(f"Error updating cluster_id for {art_id}: {e}")
 
     logger.info(f"cluster_articles finished: {len(articles)} analyzed, {len(cluster_groups)} clusters, {multi_article_clusters} multi-article stories.")
     return {

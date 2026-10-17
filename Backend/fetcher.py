@@ -1,6 +1,7 @@
 import re
 import email.utils
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -165,58 +166,41 @@ def fetch_all() -> Dict[str, Any]:
         "Accept": "application/rss+xml, application/rdf+xml, application/atom+xml, application/xml, text/xml, */*"
     }
 
-    # 3. Process feeds with 10-second timeout per feed
-    for feed_info in all_feeds:
-        feed_name = feed_info.get("name", "Unknown Feed")
-        feed_url = feed_info.get("url", "").strip()
-        default_topic = feed_info.get("default_topic", "world")
-
-        if not feed_url:
-            continue
+    def fetch_single_feed(feed_info: Dict[str, str]) -> Dict[str, Any]:
+        name = feed_info.get("name", "Unknown Feed")
+        url = feed_info.get("url", "").strip()
+        if not url:
+            return {"name": name, "url": url, "articles": [], "error": None}
 
         try:
-            logger.info(f"Fetching RSS feed: {feed_name} ({feed_url})")
-            
-            # Fetch content with strict 10s timeout via httpx
-            with httpx.Client(timeout=10.0, follow_redirects=True, headers=headers) as http_client:
-                resp = http_client.get(feed_url)
+            with httpx.Client(timeout=8.0, follow_redirects=True, headers=headers) as http_client:
+                resp = http_client.get(url)
                 resp.raise_for_status()
                 feed_data = resp.content
 
             parsed = feedparser.parse(feed_data)
-
-            # If entries empty and bozo flag raised without feed title, treat as failed feed
             if not parsed.entries and getattr(parsed, "bozo", 0) != 0 and not getattr(parsed, "feed", None):
-                raise ValueError(f"Empty or unparseable XML feed from {feed_url}")
+                return {"name": name, "url": url, "articles": [], "error": f"Empty or unparseable XML feed from {url}"}
 
-            # 4. Extract entries and upsert
+            articles = []
             for entry in parsed.entries:
                 link = getattr(entry, "link", None) or entry.get("link")
                 title = getattr(entry, "title", None) or entry.get("title")
-
                 if not link or not title:
                     continue
 
-                link = str(link).strip()
-                title = str(title).strip()
-
-                # Published date check: Skip articles older than 48 hours
                 pub_dt = parse_published_datetime(entry)
                 if pub_dt < cutoff_time:
                     continue
 
-                # Clean summary
                 raw_summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
                 text_summary = strip_html(raw_summary)
-
-                # Extract image_url: media_content, media_thumbnail, enclosures, or <img>
                 image_url = extract_image_url(entry, raw_summary)
 
-                # Prepare article record matching Supabase articles table
-                article_record = {
-                    "title": title,
-                    "link": link,
-                    "source": feed_name,
+                articles.append({
+                    "title": str(title).strip(),
+                    "link": str(link).strip(),
+                    "source": name,
                     "summary": text_summary,
                     "ai_summary": None,
                     "topic": None,
@@ -224,24 +208,38 @@ def fetch_all() -> Dict[str, Any]:
                     "tone": "neutral",
                     "published_at": pub_dt.isoformat(),
                     "created_at": datetime.now(timezone.utc).isoformat()
-                }
+                })
 
-                # Upsert into Supabase articles using link as unique key
-                try:
-                    res = client.table("articles").upsert(article_record, on_conflict="link").execute()
-                    if res.data:
-                        articles_saved += 1
-                except Exception as up_err:
-                    logger.debug(f"Article upsert error for {link}: {up_err}")
-
+            return {"name": name, "url": url, "articles": articles, "error": None}
         except Exception as exc:
-            logger.warning(f"Feed failed: {feed_name} ({feed_url}) - {exc}")
-            failed_feeds.append({
-                "name": feed_name,
-                "url": feed_url,
-                "error": str(exc)
-            })
-            continue
+            return {"name": name, "url": url, "articles": [], "error": str(exc)}
+
+    # Fetch all feeds concurrently
+    all_articles_to_save: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(fetch_single_feed, f) for f in all_feeds]
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res["error"]:
+                logger.warning(f"Feed failed: {res['name']} ({res['url']}) - {res['error']}")
+                failed_feeds.append({
+                    "name": res["name"],
+                    "url": res["url"],
+                    "error": res["error"]
+                })
+            else:
+                all_articles_to_save.extend(res["articles"])
+
+    # Batch upsert articles in chunks of 50
+    chunk_size = 50
+    for i in range(0, len(all_articles_to_save), chunk_size):
+        chunk = all_articles_to_save[i:i + chunk_size]
+        try:
+            res = client.table("articles").upsert(chunk, on_conflict="link").execute()
+            if res.data:
+                articles_saved += len(res.data)
+        except Exception as up_err:
+            logger.debug(f"Batch article upsert error: {up_err}")
 
     logger.info(f"fetch_all completed. Articles saved: {articles_saved}, Failed feeds: {len(failed_feeds)}")
     return {

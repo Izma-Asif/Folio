@@ -26,6 +26,13 @@ logger = logging.getLogger("folio.main")
 # In-memory edition build cache: (user_id, edition_date) -> (timestamp, content)
 EDITION_BUILD_CACHE: Dict[tuple, tuple] = {}
 
+
+def clear_user_build_cache(user_id: str):
+    """Evicts any cached builds for a user after setting adjustments or interactions."""
+    keys_to_del = [k for k in EDITION_BUILD_CACHE if k[0] == user_id]
+    for k in keys_to_del:
+        EDITION_BUILD_CACHE.pop(k, None)
+
 # Import Folio modules
 from db import (
     DEFAULT_USER_ID,
@@ -268,11 +275,24 @@ def create_user_endpoint(req: UserCreate):
         logger.error(f"Error creating user in Supabase: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create user: {e}")
 
-    # Set topic_weights to 0.8 for chosen interests and 0.3 for all other topics
+    # Set topic_weights to 0.8 for chosen interests and 0.3 for all other topics in one batch
     chosen_interests_lower = {i.lower().strip() for i in req.interests}
+    weights_batch = []
     for topic in ALLOWED_TOPICS:
-        weight = 0.8 if topic.lower() in chosen_interests_lower else 0.3
-        update_topic_weight(user_id, topic.lower(), weight)
+        clean_topic = topic.lower().strip()
+        weight = 0.8 if clean_topic in chosen_interests_lower else 0.3
+        weights_batch.append({
+            "user_id": user_id,
+            "topic": clean_topic,
+            "weight": weight
+        })
+    try:
+        client.table("topic_weights").upsert(weights_batch, on_conflict="user_id,topic").execute()
+    except Exception as e:
+        logger.warning(f"Error batch inserting topic weights for user {user_id}: {e}")
+        # Fallback to single updates if batch upsert constraint differs
+        for row in weights_batch:
+            update_topic_weight(user_id, row["topic"], row["weight"])
 
     return {"user_id": user_id}
 
@@ -817,6 +837,7 @@ def post_event(event: InteractionEvent):
         event_type=event.type,
         reason=event.reason,
     )
+    clear_user_build_cache(target_user_id)
     return result
 
 
@@ -852,7 +873,9 @@ def post_user_editor_note(user_id: str, req: EditorNoteRequest):
     """
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="Text instruction cannot be empty")
-    return apply_editor_instruction(user_id=user_id, text=req.text.strip())
+    res = apply_editor_instruction(user_id=user_id, text=req.text.strip())
+    clear_user_build_cache(user_id)
+    return res
 
 
 @app.get("/api/users/{user_id}/editor-notes")

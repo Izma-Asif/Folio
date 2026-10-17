@@ -35,6 +35,7 @@ export interface Story {
   readingTime: number;
   tags: string[];
   imageUrl?: string;
+  link?: string;
 }
 
 export interface Edition {

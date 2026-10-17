@@ -46,7 +46,7 @@ from fetcher import fetch_all, ingest_all_sources
 from scorer import ALLOWED_TOPICS, score_new_articles, cluster_articles
 from learner import record_interaction, get_user_learning_profile
 from angles import analyze_article_angles
-from editor import generate_daily_edition
+from ranker import build_edition
 from pdf_maker import generate_edition_pdf, render_edition_html
 from ai import gemini_json
 
@@ -529,43 +529,65 @@ def get_article_angles(article_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/editions/generate")
-def generate_edition(req: GenerateEditionRequest):
-    """Orchestrates generation of the personalized daily edition."""
-    target_user_id = req.user_id or DEFAULT_USER_ID
-    edition = generate_daily_edition(
-        user_id=target_user_id,
-        edition_date=req.edition_date,
-        force_fetch=req.force_fetch or False
-    )
-    return edition
+def api_generate_edition(
+    user_id: str = Query(default=DEFAULT_USER_ID),
+    edition_date: Optional[str] = Query(default=None)
+):
+    """Builds (or replaces today's) personalized edition using ranker.build_edition."""
+    edition_content = build_edition(user_id=user_id, edition_date=edition_date)
+    return edition_content
 
 
-@app.get("/api/editions/today")
-def get_today_edition(user_id: Optional[str] = Query(default=DEFAULT_USER_ID)):
-    """Fetches or automatically creates today's edition for the reader."""
-    today_date = datetime.now().strftime("%Y-%m-%d")
-    latest = get_latest_edition(user_id)
-
-    if latest and latest.get("edition_date") == today_date:
-        return latest
-
-    # Generate fresh edition for today
-    return generate_daily_edition(user_id=user_id, edition_date=today_date)
+@app.get("/api/editions")
+def api_list_editions(
+    user_id: str = Query(default=DEFAULT_USER_ID),
+    limit: int = Query(default=15, le=30)
+):
+    """Lists past editions for a user as summaries: {id, date, masthead, lead_title, story_count}."""
+    client = get_supabase()
+    try:
+        res = (
+            client.table("editions")
+            .select("id, user_id, edition_date, content, created_at")
+            .eq("user_id", user_id)
+            .order("edition_date", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        summaries = []
+        for ed in (res.data or []):
+            content = ed.get("content") or {}
+            lead = content.get("lead") or {}
+            all_articles = [lead] if lead else []
+            for sec in content.get("sections", []):
+                all_articles.extend(sec.get("articles", []))
+            all_articles.extend(content.get("explore", []))
+            summaries.append({
+                "id": ed["id"],
+                "date": ed.get("edition_date"),
+                "masthead": content.get("masthead", "The Morning Folio"),
+                "lead_title": lead.get("title", ""),
+                "story_count": len(all_articles),
+            })
+        return summaries
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/editions/{edition_id}")
-def get_single_edition(edition_id: str):
-    """Retrieves a specific edition by ID."""
-    edition = get_edition(edition_id)
-    if not edition:
-        raise HTTPException(status_code=404, detail="Edition not found")
-    return edition
-
-
-@app.get("/api/editions/user/{user_id}")
-def list_editions(user_id: str, limit: int = Query(default=10, le=30)):
-    """Lists past editions for user."""
-    return list_user_editions(user_id=user_id, limit=limit)
+def api_get_edition(edition_id: str):
+    """Retrieves a full edition by its ID."""
+    client = get_supabase()
+    try:
+        res = client.table("editions").select("*").eq("id", edition_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Edition not found")
+        ed = res.data[0]
+        return ed.get("content") or ed
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/editions/{edition_id}/html")
